@@ -1,0 +1,10 @@
+# Generated from config/ap.env by scripts/ap-up.sh - do not edit in place,
+# edit /etc/lite-recorder/ap.env and re-run the install script instead.
+interface=__WIFI_IFACE__
+bind-interfaces
+dhcp-range=__AP_DHCP_RANGE_START__,__AP_DHCP_RANGE_END__,__AP_NETMASK__,12h
+dhcp-option=3,__AP_ADDR__
+dhcp-option=6,__AP_ADDR__
+domain-needed
+bogus-priv
+no-resolv

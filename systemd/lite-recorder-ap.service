@@ -1,0 +1,15 @@
+[Unit]
+Description=Lite-Recorder Wi-Fi access point setup
+Before=hostapd.service dnsmasq.service
+Wants=hostapd.service dnsmasq.service
+After=network-pre.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/lite-recorder/scripts/ap-up.sh
+ExecStop=/opt/lite-recorder/scripts/ap-down.sh
+
+[Install]
+WantedBy=multi-user.target

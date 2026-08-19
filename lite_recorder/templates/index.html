@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lite-Recorder</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>Lite-Recorder</h1>
+  <nav>
+    <button class="tab-btn active" data-tab="live">Live</button>
+    <button class="tab-btn" data-tab="cameras">Cameras</button>
+    <button class="tab-btn" data-tab="gallery">Gallery</button>
+  </nav>
+</header>
+
+<div id="encoder-banner" class="banner hidden"></div>
+
+<main>
+  <section id="tab-live" class="tab active">
+    <div class="record-bar">
+      <button id="record-toggle" class="record-btn">● Start Recording</button>
+      <span id="record-status" class="record-status">Not recording</span>
+      <span id="record-timer" class="record-timer"></span>
+      <button id="rescan-btn" class="secondary-btn">Rescan Cameras</button>
+    </div>
+    <div id="camera-grid" class="camera-grid"></div>
+  </section>
+
+  <section id="tab-cameras" class="tab">
+    <table id="camera-table" class="camera-table">
+      <thead>
+        <tr>
+          <th>Enabled</th><th>Label</th><th>Source</th><th>Resolution</th>
+          <th>FPS</th><th>Bitrate (kbps)</th><th>State</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section id="tab-gallery" class="tab">
+    <div id="gallery-list"></div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
