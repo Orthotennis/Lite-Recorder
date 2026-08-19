@@ -15,7 +15,7 @@ INSTALL_DIR=/opt/lite-recorder
 echo "==> Installing system packages"
 apt-get update
 apt-get install -y --no-install-recommends \
-  ffmpeg hostapd dnsmasq v4l-utils python3-venv python3-pip iproute2 rfkill
+  ffmpeg hostapd dnsmasq v4l-utils python3-venv python3-pip iproute2 rfkill rsync
 
 # hostapd/dnsmasq ship disabled by default on Debian/Ubuntu; we drive
 # them via our own oneshot unit + generated configs.

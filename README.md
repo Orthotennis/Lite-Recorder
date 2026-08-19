@@ -73,6 +73,26 @@ sudo systemctl start lite-recorder-ap.service lite-recorder.service
 
 or just `sudo reboot` — both are enabled on boot.
 
+### Uninstalling
+
+```
+sudo ./scripts/uninstall.sh
+```
+
+Stops and disables both services, removes the systemd unit files, and
+deletes the installed app (`/opt/lite-recorder`) and the service user.
+By default it **keeps** your config (`/etc/lite-recorder`) and your
+recordings/app state (`/var/lib/lite-recorder`) — nothing you've
+recorded is touched. Add flags to remove more:
+
+- `--purge-config` — also delete `/etc/lite-recorder` (AP/app config).
+- `--purge-data` — also delete `/var/lib/lite-recorder`, **including
+  all recordings**. Prompts for confirmation unless `-y` is given.
+- `--purge-packages` — also remove `ffmpeg`, `hostapd`, `dnsmasq`,
+  `v4l-utils` (skipped by default in case other things on the board
+  use them).
+- `-y` / `--yes` — skip the `--purge-data` confirmation prompt.
+
 ### Picking the right `WIFI_IFACE`
 
 This is the one setting that reliably needs adjusting per-board:
@@ -144,7 +164,7 @@ degraded path deliberately.
 ```
 lite_recorder/     application package (discovery, encoding, camera
                     process management, recording sessions, web API/UI)
-scripts/            install.sh, ap-up.sh, ap-down.sh
+scripts/            install.sh, uninstall.sh, ap-up.sh, ap-down.sh
 systemd/            lite-recorder.service, lite-recorder-ap.service
 config/             hostapd/dnsmasq templates, .env.example files
 tests/              pytest suite
