@@ -58,7 +58,9 @@ class FakeV4L2Node:
 
 def _patched(node: FakeV4L2Node):
     def fake_ioctl(fd, request, buf):
-        return node.ioctl(request, bytes(buf))
+        result = node.ioctl(request, bytes(buf))
+        buf[: len(result)] = result
+        return 0
 
     return mock.patch("fcntl.ioctl", side_effect=fake_ioctl)
 
@@ -119,7 +121,9 @@ def test_discover_cameras_filters_and_orders(tmp_path):
 
     def fake_ioctl(fd, request, buf):
         node = good if fd == 1 else bad
-        return node.ioctl(request, bytes(buf))
+        result = node.ioctl(request, bytes(buf))
+        buf[: len(result)] = result
+        return 0
 
     with mock.patch("glob.glob", return_value=["/dev/video1", "/dev/video0"]), mock.patch(
         "os.open", side_effect=fake_open
