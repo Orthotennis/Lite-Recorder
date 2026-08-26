@@ -75,6 +75,7 @@ if [[ $PURGE_CONFIG -eq 1 ]]; then
   echo "==> Removing config ($CONFIG_DIR)"
   rm -rf "$CONFIG_DIR"
   rm -f /etc/dnsmasq.d/lite-recorder.conf
+  [[ -L /etc/hostapd/hostapd.conf ]] && rm -f /etc/hostapd/hostapd.conf
 else
   echo "==> Keeping config in $CONFIG_DIR (use --purge-config to remove)"
 fi
