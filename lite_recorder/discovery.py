@@ -30,6 +30,8 @@ V4L2_CAP_DEVICE_CAPS = 0x80000000
 
 V4L2_BUF_TYPE_VIDEO_CAPTURE = 1
 V4L2_FRMSIZE_TYPE_DISCRETE = 1
+V4L2_FRMSIZE_TYPE_CONTINUOUS = 2
+V4L2_FRMSIZE_TYPE_STEPWISE = 3
 V4L2_FRMIVAL_TYPE_DISCRETE = 1
 
 # struct v4l2_capability { u8 driver[16]; u8 card[32]; u8 bus_info[32];
@@ -43,9 +45,12 @@ _FMTDESC_FMT = "III32sII12x"
 _FMTDESC_SIZE = struct.calcsize(_FMTDESC_FMT)
 
 # struct v4l2_frmsizeenum { u32 index; u32 pixel_format; u32 type;
-#   u32 width; u32 height; u32 stepwise_pad[4]; u32 reserved[2]; }
-# (only the discrete branch of the union is used/read)
-_FRMSIZE_FMT = "IIIII16x8x"
+#   union { struct discrete{width,height}; struct stepwise{min_width,
+#   max_width,step_width,min_height,max_height,step_height}; }; u32 reserved[2]; }
+# The 6 trailing u32s are read generically and reinterpreted per `type`:
+# discrete uses only the first two (width, height); stepwise/continuous use
+# all six (the discrete width/height alias min_width/max_width).
+_FRMSIZE_FMT = "IIIIIIIII8x"
 _FRMSIZE_SIZE = struct.calcsize(_FRMSIZE_FMT)
 
 # struct v4l2_frmivalenum { u32 index; u32 pixel_format; u32 width;
@@ -146,13 +151,18 @@ def _enum_framesizes(fd: int, pixel_format: str) -> list[tuple[int, int]]:
     pf = _str_to_fourcc(pixel_format)
     while True:
         try:
-            buf = bytearray(struct.pack(_FRMSIZE_FMT, index, pf, 0, 0, 0))
+            buf = bytearray(struct.pack(_FRMSIZE_FMT, index, pf, 0, 0, 0, 0, 0, 0, 0))
             fcntl.ioctl(fd, VIDIOC_ENUM_FRAMESIZES, buf)
-            _, _, ftype, width, height = struct.unpack(_FRMSIZE_FMT, buf)
+            _, _, ftype, f1, f2, f3, f4, f5, f6 = struct.unpack(_FRMSIZE_FMT, buf)
         except OSError:
             break
         if ftype == V4L2_FRMSIZE_TYPE_DISCRETE:
-            sizes.append((width, height))
+            sizes.append((f1, f2))
+        elif ftype in (V4L2_FRMSIZE_TYPE_STEPWISE, V4L2_FRMSIZE_TYPE_CONTINUOUS):
+            # Only a single entry describes the whole min/max/step range
+            # (index > 0 always fails), so report the max size and stop.
+            sizes.append((f2, f5))
+            break
         index += 1
         if index > 64:
             break
@@ -249,7 +259,11 @@ def discover_cameras() -> list[CameraDevice]:
     nodes = sorted(glob.glob("/dev/video*"), key=lambda p: int("".join(filter(str.isdigit, p)) or 0))
     cameras: list[CameraDevice] = []
     for node in nodes:
-        cam = probe_device(node)
+        try:
+            cam = probe_device(node)
+        except Exception:
+            logger.exception("failed to probe %s, skipping", node)
+            continue
         if cam is not None:
             cameras.append(cam)
     return cameras
