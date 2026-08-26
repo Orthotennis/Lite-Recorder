@@ -45,6 +45,16 @@ render() {
 render "$TEMPLATE_DIR/hostapd.conf.template" "$OUT_DIR/hostapd.conf"
 render "$TEMPLATE_DIR/dnsmasq.conf.template" /etc/dnsmasq.d/lite-recorder.conf
 
+# Debian/Ubuntu's hostapd.service ships with
+# ConditionFileNotEmpty=/etc/hostapd/hostapd.conf hardcoded into the unit
+# (so it can no-op instead of failing for users who never configured it).
+# That condition is checked against the hardcoded default path, not the
+# DAEMON_CONF override in /etc/default/hostapd, so without this symlink
+# hostapd.service silently skips ("Condition check failed") even though
+# DAEMON_CONF correctly points at our rendered config.
+mkdir -p /etc/hostapd
+ln -sf "$OUT_DIR/hostapd.conf" /etc/hostapd/hostapd.conf
+
 echo "ap-up.sh: unblocking rfkill and preparing $WIFI_IFACE"
 rfkill unblock wifi || true
 
