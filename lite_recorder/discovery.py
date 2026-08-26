@@ -94,15 +94,15 @@ class CameraDevice:
 
 
 def _ioctl_struct(fd: int, request: int, fmt: str, *values) -> tuple:
-    buf = struct.pack(fmt, *values)
-    buf = fcntl.ioctl(fd, request, bytearray(buf))
+    buf = bytearray(struct.pack(fmt, *values))
+    fcntl.ioctl(fd, request, buf)
     return struct.unpack(fmt, buf)
 
 
 def _query_cap(fd: int) -> dict | None:
     try:
         buf = bytearray(_CAPABILITY_SIZE)
-        buf = fcntl.ioctl(fd, VIDIOC_QUERYCAP, buf)
+        fcntl.ioctl(fd, VIDIOC_QUERYCAP, buf)
         driver, card, bus_info, version, capabilities, device_caps = struct.unpack(
             _CAPABILITY_FMT, buf
         )
@@ -124,11 +124,12 @@ def _enum_formats(fd: int) -> list[str]:
     index = 0
     while True:
         try:
-            buf = bytearray(_FMTDESC_SIZE)
-            packed = struct.pack(
-                _FMTDESC_FMT, index, V4L2_BUF_TYPE_VIDEO_CAPTURE, 0, b"\x00" * 32, 0, 0
+            buf = bytearray(
+                struct.pack(
+                    _FMTDESC_FMT, index, V4L2_BUF_TYPE_VIDEO_CAPTURE, 0, b"\x00" * 32, 0, 0
+                )
             )
-            buf = fcntl.ioctl(fd, VIDIOC_ENUM_FMT, bytearray(packed))
+            fcntl.ioctl(fd, VIDIOC_ENUM_FMT, buf)
             _, _, _, _description, pixelformat, _mbus = struct.unpack(_FMTDESC_FMT, buf)
         except OSError:
             break
@@ -145,8 +146,8 @@ def _enum_framesizes(fd: int, pixel_format: str) -> list[tuple[int, int]]:
     pf = _str_to_fourcc(pixel_format)
     while True:
         try:
-            packed = struct.pack(_FRMSIZE_FMT, index, pf, 0, 0, 0)
-            buf = fcntl.ioctl(fd, VIDIOC_ENUM_FRAMESIZES, bytearray(packed))
+            buf = bytearray(struct.pack(_FRMSIZE_FMT, index, pf, 0, 0, 0))
+            fcntl.ioctl(fd, VIDIOC_ENUM_FRAMESIZES, buf)
             _, _, ftype, width, height = struct.unpack(_FRMSIZE_FMT, buf)
         except OSError:
             break
@@ -164,8 +165,8 @@ def _enum_frameintervals(fd: int, pixel_format: str, width: int, height: int) ->
     pf = _str_to_fourcc(pixel_format)
     while True:
         try:
-            packed = struct.pack(_FRMIVAL_FMT, index, pf, width, height, 0, 0, 0)
-            buf = fcntl.ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, bytearray(packed))
+            buf = bytearray(struct.pack(_FRMIVAL_FMT, index, pf, width, height, 0, 0, 0))
+            fcntl.ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, buf)
             _, _, _, _, ftype, num, den = struct.unpack(_FRMIVAL_FMT, buf)
         except OSError:
             break
