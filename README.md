@@ -51,6 +51,19 @@ Options: `--port N`, `--host H`, `--real` (use actual V4L2 cameras
 instead of simulated ones). Any other arguments are passed through to
 `python -m lite_recorder`.
 
+**Windows / WSL note:** if the script fails with
+`: invalid option name: set: pipefail` (or `bash\r: bad interpreter`),
+the files were checked out with CRLF line endings by Git for Windows
+(`core.autocrlf=true`). `.gitattributes` now forces LF, so a fresh clone
+is fine; to fix an existing clone, run from the repo root:
+
+```
+git rm -r --cached -q . && git reset --hard
+```
+
+Running the app from the Linux filesystem (e.g. `~/Lite-Recorder`)
+rather than `/mnt/c/...` also avoids this and is much faster.
+
 Or by hand:
 
 ```
