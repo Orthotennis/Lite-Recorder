@@ -54,10 +54,16 @@ instead of simulated ones). Any other arguments are passed through to
 **Windows / WSL note:** if the script fails with
 `: invalid option name: set: pipefail` (or `bash\r: bad interpreter`),
 the files were checked out with CRLF line endings by Git for Windows
-(`core.autocrlf=true`). `.gitattributes` now forces LF, so a fresh clone
-is fine; to fix an existing clone, run from the repo root:
+(`core.autocrlf=true`). `run-local.sh` detects this and re-runs itself
+with the CRs stripped, so `bash scripts/run-local.sh` works on such a
+checkout (`./scripts/run-local.sh` still cannot, because the kernel reads
+the `#!/bin/bash\r` shebang before bash gets a chance). `.gitattributes`
+forces LF, so a fresh clone is fine, but Git does not rewrite files that
+are already checked out. To fix an existing clone, run from the repo root
+(this discards uncommitted changes):
 
 ```
+git pull
 git rm -r --cached -q . && git reset --hard
 ```
 

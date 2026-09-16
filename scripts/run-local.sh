@@ -8,9 +8,18 @@
 # Nothing touches /opt, /etc or /var: the Python virtualenv lives in
 # ./.venv and recordings/state live in ./.local (both git-ignored).
 # Requires python3 (with the venv module) and ffmpeg on PATH.
+#
+# If this file was checked out with CRLF line endings (Git for Windows with
+# core.autocrlf=true, before .gitattributes forced LF), bash fails on
+# "set -o pipefail\r". Re-run a copy with the CRs stripped instead. Kept on one
+# line ending in a comment so this line itself parses with a trailing CR, and
+# with no blank line above it (a bare CR would be run as a command).
+[ -z "${LITE_RECORDER_CRLF_FIXED-}" ] && grep -q $'\r' "$0" && LITE_RECORDER_CRLF_FIXED=1 exec bash -c "$(tr -d '\r' < "$0")" "$0" "$@" #
+
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# BASH_SOURCE is empty under the "bash -c" re-exec above, so fall back to $0.
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 VENV_DIR="$REPO_DIR/.venv"
 LOCAL_DIR="$REPO_DIR/.local"
 
@@ -25,7 +34,7 @@ while [[ $# -gt 0 ]]; do
     --host) HOST="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     -h|--help)
-      sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//' | tr -d '\r'
       exit 0 ;;
     *) EXTRA_ARGS+=("$1"); shift ;;
   esac
