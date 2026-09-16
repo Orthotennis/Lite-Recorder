@@ -40,16 +40,38 @@ the MP4 file — so live preview keeps working during a take.
 ```
 
 Open `http://127.0.0.1:8080`. The script creates a virtualenv in
-`./.venv`, installs the Python dependencies, and starts the app with
-synthetic test-pattern cameras (`--simulate`), so the full UI —
-preview, recording, gallery, playback — can be exercised on any
-machine with `python3` and `ffmpeg` installed. Recordings and state
-are kept under `./.local/` inside the repo; nothing is written to
-`/opt`, `/etc` or `/var`. Delete `.venv` and `.local` to clean up.
+`./.venv`, installs the Python dependencies, and **records from
+whatever real cameras are attached** — a USB webcam, a laptop's
+built-in camera, a MIPI CSI sensor — exactly as it does on the board.
+Recordings and state are kept under `./.local/` inside the repo;
+nothing is written to `/opt`, `/etc` or `/var`. Delete `.venv` and
+`.local` to clean up.
 
-Options: `--port N`, `--host H`, `--real` (use actual V4L2 cameras
-instead of simulated ones). Any other arguments are passed through to
-`python -m lite_recorder`.
+If no camera is found, it falls back to synthetic test patterns so the
+UI can still be exercised, and says so both on the console and in a
+banner in the web UI — a run never *looks* like real footage when it
+isn't.
+
+Camera options:
+
+- `--real` — real cameras only. No camera means no cameras in the UI
+  and a clear error when you press Record, instead of a silent fallback.
+- `--simulate` — synthetic test patterns only, no camera needed.
+- `--camera-mode auto|real|simulate` — the long form of the above
+  (`auto` is the default).
+
+Also `--port N` and `--host H`; any other arguments are passed through
+to `python -m lite_recorder`.
+
+**If you get test patterns when you expected your webcam**, the console
+output names the reason. The usual ones:
+
+- No `/dev/video*` devices at all — nothing is plugged in, or (on WSL)
+  the webcam has not been attached to the Linux VM with `usbipd`.
+- Permission denied — add yourself to the `video` group with
+  `sudo usermod -aG video $USER`, then log out and back in.
+- The nodes exist but none is capture-capable — some devices expose
+  metadata-only nodes; check `v4l2-ctl --list-devices`.
 
 **Windows / WSL note:** if the script fails with
 `: invalid option name: set: pipefail` (or `bash\r: bad interpreter`),
@@ -70,7 +92,8 @@ Or by hand:
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements-dev.txt
-python -m lite_recorder --simulate --port 8080
+python -m lite_recorder --port 8080          # real cameras, sim fallback
+python -m lite_recorder --real --port 8080  # real cameras only
 ```
 
 Run the test suite with `pytest` (requires `ffmpeg` on `PATH`).
@@ -168,8 +191,10 @@ onboard storage is too small. Nothing is ever auto-deleted.
   channel, country, static IP/DHCP range. See
   `config/ap.env.example`.
 - `/etc/lite-recorder/app.env` — app: recordings root, state dir,
-  host/port, `LITE_RECORDER_FORCE_ENCODER` (pin a specific encoder).
-  See `config/lite-recorder.env.example`.
+  host/port, `LITE_RECORDER_CAMERA_MODE` (`real` on the board, so a
+  missing camera is never quietly replaced by a test pattern),
+  `LITE_RECORDER_FORCE_ENCODER` (pin a specific encoder). See
+  `config/lite-recorder.env.example`.
 - `/var/lib/lite-recorder/cameras.json` — persisted per-camera
   label/resolution/fps/bitrate/enabled settings (managed by the UI).
 

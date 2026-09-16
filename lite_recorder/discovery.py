@@ -215,23 +215,24 @@ def _stable_id(device_node: str) -> str:
     return name
 
 
-def probe_device(device_node: str) -> CameraDevice | None:
-    """Open a single /dev/videoN node and return a CameraDevice if it is
-    a genuine capture device, else None (metadata nodes, subdevs, etc.)."""
+def _probe_device_detail(device_node: str) -> tuple[CameraDevice | None, str]:
+    """Probe one node, returning (device, reason_it_was_rejected)."""
     try:
         fd = os.open(device_node, os.O_RDWR | os.O_NONBLOCK)
+    except PermissionError:
+        return None, "permission denied (is your user in the 'video' group?)"
     except OSError as exc:
         logger.debug("cannot open %s: %s", device_node, exc)
-        return None
+        return None, f"cannot open ({exc.strerror or exc})"
     try:
         cap = _query_cap(fd)
         if cap is None:
-            return None
+            return None, "not a V4L2 device (VIDIOC_QUERYCAP failed)"
         if not (cap["capabilities"] & V4L2_CAP_VIDEO_CAPTURE):
-            return None
+            return None, "not a video-capture node (metadata/output/subdev)"
         pixel_formats = _enum_formats(fd)
         if not pixel_formats:
-            return None
+            return None, "no capture pixel formats reported"
         formats = []
         for pf in pixel_formats:
             for width, height in _enum_framesizes(fd, pf):
@@ -240,9 +241,9 @@ def probe_device(device_node: str) -> CameraDevice | None:
                     FrameFormat(pixel_format=pf, width=width, height=height, framerates=rates)
                 )
         if not formats:
-            return None
+            return None, "no frame sizes reported"
         source = _classify_source(cap["driver"], cap["bus_info"])
-        return CameraDevice(
+        device = CameraDevice(
             id=_stable_id(device_node),
             device_node=device_node,
             name=cap["card"] or cap["driver"],
@@ -250,21 +251,77 @@ def probe_device(device_node: str) -> CameraDevice | None:
             driver=cap["driver"],
             formats=formats,
         )
+        return device, ""
     finally:
         os.close(fd)
+
+
+def probe_device(device_node: str) -> CameraDevice | None:
+    """Open a single /dev/videoN node and return a CameraDevice if it is
+    a genuine capture device, else None (metadata nodes, subdevs, etc.)."""
+    device, _reason = _probe_device_detail(device_node)
+    return device
+
+
+@dataclass
+class DiscoveryReport:
+    """What a scan of /dev/video* found, including why nodes were skipped.
+
+    Kept alongside the camera list so the app can explain an empty result
+    ("no /dev/video* nodes at all" vs "found one but permission denied")
+    instead of just showing an empty grid.
+    """
+
+    cameras: list[CameraDevice] = field(default_factory=list)
+    rejected: list[tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def nodes_seen(self) -> int:
+        return len(self.cameras) + len(self.rejected)
+
+    def explain_empty(self) -> str:
+        """A one-line, actionable reason why no cameras were found."""
+        if self.cameras:
+            return ""
+        if not self.rejected:
+            if not os.path.isdir("/dev"):
+                return "no /dev directory — V4L2 capture is Linux-only."
+            return (
+                "no /dev/video* devices exist on this machine. Plug in a USB "
+                "webcam (on WSL, attach it with usbipd; on a Rock 5B+, enable "
+                "the CSI overlay with rsetup)."
+            )
+        if all("permission denied" in reason for _node, reason in self.rejected):
+            return (
+                "found "
+                + ", ".join(node for node, _ in self.rejected)
+                + " but could not open them: permission denied. Add your user to "
+                "the 'video' group (sudo usermod -aG video $USER) and log back in."
+            )
+        details = "; ".join(f"{node}: {reason}" for node, reason in self.rejected)
+        return f"no capture-capable camera among the /dev/video* nodes ({details})."
+
+
+def discover_cameras_report() -> DiscoveryReport:
+    """Enumerate every /dev/video* node, returning the capture devices
+    found plus the reason each other node was skipped."""
+    nodes = sorted(glob.glob("/dev/video*"), key=lambda p: int("".join(filter(str.isdigit, p)) or 0))
+    report = DiscoveryReport()
+    for node in nodes:
+        try:
+            cam, reason = _probe_device_detail(node)
+        except Exception as exc:  # noqa: BLE001 - one bad node must not kill the scan
+            logger.exception("failed to probe %s, skipping", node)
+            report.rejected.append((node, f"probe raised {exc.__class__.__name__}: {exc}"))
+            continue
+        if cam is not None:
+            report.cameras.append(cam)
+        else:
+            report.rejected.append((node, reason))
+    return report
 
 
 def discover_cameras() -> list[CameraDevice]:
     """Enumerate every /dev/video* node and return the subset that are
     genuine capture devices, sorted by device node for stable ordering."""
-    nodes = sorted(glob.glob("/dev/video*"), key=lambda p: int("".join(filter(str.isdigit, p)) or 0))
-    cameras: list[CameraDevice] = []
-    for node in nodes:
-        try:
-            cam = probe_device(node)
-        except Exception:
-            logger.exception("failed to probe %s, skipping", node)
-            continue
-        if cam is not None:
-            cameras.append(cam)
-    return cameras
+    return discover_cameras_report().cameras

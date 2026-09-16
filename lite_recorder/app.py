@@ -79,7 +79,9 @@ def create_app(settings: Settings) -> FastAPI:
     def api_system():
         return {
             "encoder": manager.encoder.to_dict(),
-            "simulate": settings.simulate,
+            "camera_mode": settings.camera_mode,
+            "simulate": manager.simulated,
+            "camera_notice": manager.camera_notice,
             "recordings_root": str(settings.recordings_root),
             "camera_count": len(manager.list_cameras()),
         }

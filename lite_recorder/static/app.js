@@ -28,6 +28,13 @@
     } else {
       banner.classList.add("hidden");
     }
+    const camBanner = $("#camera-banner");
+    if (data.camera_notice) {
+      camBanner.textContent = data.camera_notice;
+      camBanner.classList.remove("hidden");
+    } else {
+      camBanner.classList.add("hidden");
+    }
   }
 
   function stateDotClass(s) {
@@ -55,6 +62,19 @@
         const el = grid.querySelector(`.camera-tile[data-id="${CSS.escape(id)}"]`);
         if (el) el.remove();
       }
+    }
+
+    let empty = grid.querySelector(".empty-note");
+    if (cameras.length === 0) {
+      if (!empty) {
+        empty = document.createElement("p");
+        empty.className = "empty-note";
+        empty.style.color = "var(--muted)";
+        grid.appendChild(empty);
+      }
+      empty.textContent = "No cameras connected. Plug one in, then press Rescan Cameras.";
+    } else if (empty) {
+      empty.remove();
     }
 
     for (const cam of cameras) {
@@ -164,7 +184,12 @@
       if (state.recording) {
         await fetch("/api/recording/stop", { method: "POST" });
       } else {
-        await fetch("/api/recording/start", { method: "POST" });
+        const res = await fetch("/api/recording/start", { method: "POST" });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          $("#record-status").textContent =
+            "Could not start: " + (body.detail || res.statusText);
+        }
       }
     } finally {
       btn.disabled = false;

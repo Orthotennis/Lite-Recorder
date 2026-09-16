@@ -34,14 +34,25 @@ class FakeV4L2Node:
                 discovery._FMTDESC_FMT, index, 1, 0, b"\x00" * 32, discovery._str_to_fourcc(pf_str), 0
             )
         if request == discovery.VIDIOC_ENUM_FRAMESIZES:
-            (index, pf, _type, _w, _h) = struct.unpack(discovery._FRMSIZE_FMT, buf)
+            # v4l2_frmsizeenum carries a 6-u32 union after index/format/type;
+            # a discrete entry uses only its first two words (width, height).
+            (index, pf, _type, *_union) = struct.unpack(discovery._FRMSIZE_FMT, buf)
             pf_str = discovery._fourcc_to_str(pf)
             sizes = next((sizes for name, sizes in self.formats if name == pf_str), [])
             if index >= len(sizes):
                 raise OSError("EINVAL")
             w, h, _rates = sizes[index]
             return struct.pack(
-                discovery._FRMSIZE_FMT, index, pf, discovery.V4L2_FRMSIZE_TYPE_DISCRETE, w, h
+                discovery._FRMSIZE_FMT,
+                index,
+                pf,
+                discovery.V4L2_FRMSIZE_TYPE_DISCRETE,
+                w,
+                h,
+                0,
+                0,
+                0,
+                0,
             )
         if request == discovery.VIDIOC_ENUM_FRAMEINTERVALS:
             (index, pf, w, h, _type, _n, _d) = struct.unpack(discovery._FRMIVAL_FMT, buf)
@@ -131,3 +142,36 @@ def test_discover_cameras_filters_and_orders(tmp_path):
         cams = discovery.discover_cameras()
 
     assert [c.device_node for c in cams] == ["/dev/video0"]
+
+
+def test_report_explains_missing_device_nodes():
+    report = discovery.DiscoveryReport(cameras=[], rejected=[])
+    with mock.patch("os.path.isdir", return_value=True):
+        assert "no /dev/video* devices exist" in report.explain_empty()
+
+
+def test_report_explains_permission_denied():
+    report = discovery.DiscoveryReport(
+        cameras=[], rejected=[("/dev/video0", "permission denied (is your user in the 'video' group?)")]
+    )
+    explanation = report.explain_empty()
+    assert "/dev/video0" in explanation
+    assert "video" in explanation
+
+
+def test_report_explains_non_capture_nodes():
+    report = discovery.DiscoveryReport(
+        cameras=[], rejected=[("/dev/video1", "not a video-capture node (metadata/output/subdev)")]
+    )
+    assert "not a video-capture node" in report.explain_empty()
+
+
+def test_report_has_no_explanation_when_cameras_found():
+    report = discovery.DiscoveryReport(
+        cameras=[
+            discovery.CameraDevice(
+                id="cam", device_node="/dev/video0", name="c", source="usb", driver="uvcvideo"
+            )
+        ]
+    )
+    assert report.explain_empty() == ""

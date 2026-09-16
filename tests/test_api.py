@@ -119,3 +119,29 @@ def test_index_page_renders(client):
     res = client.get("/")
     assert res.status_code == 200
     assert "Lite-Recorder" in res.text
+
+
+def test_system_endpoint_reports_camera_mode(client):
+    data = client.get("/api/system").json()
+    assert data["camera_mode"] == "simulate"
+    assert data["simulate"] is True
+    assert "synthetic test patterns" in data["camera_notice"]
+
+
+def test_start_recording_without_cameras_returns_409(tmp_path, monkeypatch):
+    from lite_recorder import discovery
+
+    monkeypatch.setattr(
+        discovery, "discover_cameras_report", lambda: discovery.DiscoveryReport()
+    )
+    settings = Settings(
+        recordings_root=tmp_path / "recordings",
+        state_dir=tmp_path / "state",
+        camera_mode="real",
+    )
+    app = create_app(settings)
+    with TestClient(app) as c:
+        assert c.get("/api/cameras").json() == []
+        res = c.post("/api/recording/start")
+        assert res.status_code == 409
+        assert "No cameras found" in res.json()["detail"]

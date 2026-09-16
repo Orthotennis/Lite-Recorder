@@ -9,8 +9,30 @@ from threading import Lock
 from typing import Any
 
 
+CAMERA_MODE_AUTO = "auto"
+CAMERA_MODE_REAL = "real"
+CAMERA_MODE_SIMULATE = "simulate"
+CAMERA_MODES = (CAMERA_MODE_AUTO, CAMERA_MODE_REAL, CAMERA_MODE_SIMULATE)
+
+
 def _env_path(name: str, default: str) -> Path:
     return Path(os.environ.get(name, default))
+
+
+def _env_camera_mode() -> str:
+    """Resolve the camera mode from the environment.
+
+    `LITE_RECORDER_CAMERA_MODE` wins; `LITE_RECORDER_SIMULATE=1` is still
+    honoured (it is what older configs and the systemd units set) and means
+    "simulate". Default is `auto`: real cameras when any are present,
+    synthetic ones only as a clearly-reported fallback.
+    """
+    mode = os.environ.get("LITE_RECORDER_CAMERA_MODE", "").strip().lower()
+    if mode in CAMERA_MODES:
+        return mode
+    if os.environ.get("LITE_RECORDER_SIMULATE", "") == "1":
+        return CAMERA_MODE_SIMULATE
+    return CAMERA_MODE_AUTO
 
 
 @dataclass
@@ -30,9 +52,10 @@ class Settings:
     )
     host: str = field(default_factory=lambda: os.environ.get("LITE_RECORDER_HOST", "0.0.0.0"))
     port: int = field(default_factory=lambda: int(os.environ.get("LITE_RECORDER_PORT", "80")))
-    simulate: bool = field(
-        default_factory=lambda: os.environ.get("LITE_RECORDER_SIMULATE", "") == "1"
-    )
+    camera_mode: str = field(default_factory=_env_camera_mode)
+    # Derived from camera_mode; passing simulate=True directly forces
+    # simulation (kept for callers that predate camera_mode).
+    simulate: bool = False
     force_encoder: str | None = field(
         default_factory=lambda: os.environ.get("LITE_RECORDER_FORCE_ENCODER") or None
     )
@@ -44,6 +67,18 @@ class Settings:
     @property
     def cameras_config_path(self) -> Path:
         return self.state_dir / "cameras.json"
+
+    def __post_init__(self) -> None:
+        # `simulate=True` passed directly (tests, embedders) forces simulation
+        # even when the environment says otherwise.
+        if self.simulate:
+            self.camera_mode = CAMERA_MODE_SIMULATE
+        if self.camera_mode not in CAMERA_MODES:
+            raise ValueError(
+                f"camera_mode must be one of {', '.join(CAMERA_MODES)}, got {self.camera_mode!r}"
+            )
+        if self.camera_mode == CAMERA_MODE_SIMULATE:
+            self.simulate = True
 
     def ensure_dirs(self) -> None:
         self.recordings_root.mkdir(parents=True, exist_ok=True)

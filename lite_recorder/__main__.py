@@ -1,4 +1,4 @@
-"""Entrypoint: `python -m lite_recorder [--simulate] [--host H] [--port P]`."""
+"""Entrypoint: `python -m lite_recorder [--camera-mode M] [--host H] [--port P]`."""
 from __future__ import annotations
 
 import argparse
@@ -7,7 +7,7 @@ import os
 
 import uvicorn
 
-from .config import Settings
+from .config import CAMERA_MODE_REAL, CAMERA_MODE_SIMULATE, CAMERA_MODES, Settings
 
 
 def main() -> None:
@@ -15,9 +15,28 @@ def main() -> None:
     parser.add_argument("--host", default=None, help="Bind host (default: env or 0.0.0.0)")
     parser.add_argument("--port", type=int, default=None, help="Bind port (default: env or 80)")
     parser.add_argument(
+        "--camera-mode",
+        choices=CAMERA_MODES,
+        default=None,
+        help=(
+            "auto (default): record from real V4L2 cameras, falling back to "
+            "synthetic ones only if none are found; real: only real cameras; "
+            "simulate: only synthetic test-pattern cameras"
+        ),
+    )
+    parser.add_argument(
+        "--real",
+        dest="camera_mode",
+        action="store_const",
+        const=CAMERA_MODE_REAL,
+        help="Shorthand for --camera-mode real",
+    )
+    parser.add_argument(
         "--simulate",
-        action="store_true",
-        help="Use synthetic test-pattern cameras instead of real V4L2 devices",
+        dest="camera_mode",
+        action="store_const",
+        const=CAMERA_MODE_SIMULATE,
+        help="Shorthand for --camera-mode simulate",
     )
     parser.add_argument(
         "--recordings-root", default=None, help="Override recordings storage root"
@@ -27,8 +46,12 @@ def main() -> None:
 
     logging.basicConfig(level=args.log_level.upper())
 
-    if args.simulate:
-        os.environ["LITE_RECORDER_SIMULATE"] = "1"
+    if args.camera_mode:
+        os.environ["LITE_RECORDER_CAMERA_MODE"] = args.camera_mode
+        # Keep the legacy env var consistent for anything reading it.
+        os.environ["LITE_RECORDER_SIMULATE"] = (
+            "1" if args.camera_mode == CAMERA_MODE_SIMULATE else "0"
+        )
     if args.recordings_root:
         os.environ["LITE_RECORDER_RECORDINGS_ROOT"] = args.recordings_root
 
