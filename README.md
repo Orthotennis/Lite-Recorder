@@ -33,7 +33,25 @@ one ffmpeg process (a V4L2 device can only be opened once) that tees
 its output to both a downscaled MJPEG preview and, while recording,
 the MP4 file — so live preview keeps working during a take.
 
-## Quick start (development / testing, no camera hardware needed)
+## Quick start (run locally, no install needed)
+
+```
+./scripts/run-local.sh
+```
+
+Open `http://127.0.0.1:8080`. The script creates a virtualenv in
+`./.venv`, installs the Python dependencies, and starts the app with
+synthetic test-pattern cameras (`--simulate`), so the full UI —
+preview, recording, gallery, playback — can be exercised on any
+machine with `python3` and `ffmpeg` installed. Recordings and state
+are kept under `./.local/` inside the repo; nothing is written to
+`/opt`, `/etc` or `/var`. Delete `.venv` and `.local` to clean up.
+
+Options: `--port N`, `--host H`, `--real` (use actual V4L2 cameras
+instead of simulated ones). Any other arguments are passed through to
+`python -m lite_recorder`.
+
+Or by hand:
 
 ```
 python3 -m venv venv
@@ -41,11 +59,6 @@ source venv/bin/activate
 pip install -r requirements-dev.txt
 python -m lite_recorder --simulate --port 8080
 ```
-
-Open `http://localhost:8080`. `--simulate` substitutes synthetic
-test-pattern cameras for real V4L2 devices, so the full UI — preview,
-recording, gallery, playback — can be exercised on any machine with
-`ffmpeg` installed.
 
 Run the test suite with `pytest` (requires `ffmpeg` on `PATH`).
 
@@ -164,7 +177,7 @@ degraded path deliberately.
 ```
 lite_recorder/     application package (discovery, encoding, camera
                     process management, recording sessions, web API/UI)
-scripts/            install.sh, uninstall.sh, ap-up.sh, ap-down.sh
+scripts/            run-local.sh, install.sh, uninstall.sh, ap-up.sh, ap-down.sh
 systemd/            lite-recorder.service, lite-recorder-ap.service
 config/             hostapd/dnsmasq templates, .env.example files
 tests/              pytest suite
