@@ -1,22 +1,32 @@
 """H.264 encoder selection and ffmpeg command construction.
 
-Prefers the RK3588 hardware encoder (h264_rkmpp), falls back to the
-generic V4L2 M2M encoder, then to software libx264 — and validates
-whatever gets picked with a tiny real encode so a present-but-broken
-hardware path doesn't silently break every recording. The chosen
-encoder's status is surfaced to the UI via EncoderInfo so a software
-fallback is never silent.
+On the Rock 5B+ this prefers the RK3588 hardware encoder (h264_rkmpp),
+falling back to the generic V4L2 M2M encoder; on Windows it prefers
+whichever GPU encoder ffmpeg reports (NVIDIA NVENC, Intel Quick Sync,
+or AMD AMF, tried in that order) — either way it falls back to software
+libx264, and validates whatever gets picked with a tiny real encode so
+a present-but-broken hardware path doesn't silently break every
+recording. The chosen encoder's status is surfaced to the UI via
+EncoderInfo so a software fallback is never silent.
 """
 from __future__ import annotations
 
 import logging
 import subprocess
+import sys
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
-_HARDWARE_ENCODERS = ["h264_rkmpp", "h264_v4l2m2m"]
+_HARDWARE_ENCODERS_LINUX = ["h264_rkmpp", "h264_v4l2m2m"]
+_HARDWARE_ENCODERS_WINDOWS = ["h264_nvenc", "h264_qsv", "h264_amf"]
 _SOFTWARE_ENCODER = "libx264"
+
+
+def _hardware_encoders() -> list[str]:
+    if sys.platform.startswith("win"):
+        return list(_HARDWARE_ENCODERS_WINDOWS)
+    return list(_HARDWARE_ENCODERS_LINUX)
 
 
 @dataclass
@@ -82,15 +92,16 @@ def select_encoder(ffmpeg_bin: str = "ffmpeg", force: str | None = None) -> Enco
     """Pick the best working H.264 encoder. `force` (from config/env) can
     pin a specific encoder, e.g. for testing the degraded-banner path."""
     available = _list_available_encoders(ffmpeg_bin)
+    hardware_encoders = _hardware_encoders()
 
-    candidates = [force] if force else _HARDWARE_ENCODERS + [_SOFTWARE_ENCODER]
+    candidates = [force] if force else hardware_encoders + [_SOFTWARE_ENCODER]
     tried: list[str] = []
     for name in candidates:
         if available and name not in available:
             continue
         ok, reason = _validate_encoder(ffmpeg_bin, name)
         if ok:
-            kind = "hardware" if name in _HARDWARE_ENCODERS else "software"
+            kind = "hardware" if name in hardware_encoders else "software"
             degraded = kind == "software"
             degrade_reason = ""
             if degraded:
@@ -125,6 +136,24 @@ def build_input_args(device: str, pixel_format: str, width: int, height: int, fp
             "lavfi",
             "-i",
             f"testsrc=size={width}x{height}:rate={fps}",
+        ]
+    if sys.platform.startswith("win"):
+        # DirectShow requests a compressed format (like MJPEG) via -vcodec
+        # and a raw one via -pixel_format — unlike V4L2, which uses
+        # -input_format for both. `device` here is the camera's DirectShow
+        # friendly name; ffmpeg wants it as a single "video=<name>" token,
+        # not split into separate arguments.
+        codec_arg = ["-vcodec", "mjpeg"] if pixel_format == "MJPG" else ["-pixel_format", "yuyv422"]
+        return [
+            "-f",
+            "dshow",
+            *codec_arg,
+            "-video_size",
+            f"{width}x{height}",
+            "-framerate",
+            str(fps),
+            "-i",
+            f"video={device}",
         ]
     fmt = "mjpeg" if pixel_format == "MJPG" else "yuyv422"
     return [

@@ -1,7 +1,8 @@
 """CameraWorker: owns the single ffmpeg process for one camera.
 
-A V4L2 device can only be opened by one process, so preview and
-recording are not separate processes — one ffmpeg process always tees
+A capture device (V4L2 on Linux, DirectShow on Windows) can only be
+opened by one process, so preview and recording are not separate
+processes — one ffmpeg process always tees
 its capture to a live MJPEG pipe (for the preview grid) and, while
 recording, simultaneously writes the MP4 file. Starting/stopping a
 recording therefore means restarting this process with a different

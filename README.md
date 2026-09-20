@@ -29,9 +29,11 @@ office.
 
 Wi-Fi AP (`hostapd` + `dnsmasq`) → static IP `192.168.4.1` → FastAPI
 web app. `ffmpeg` does all capture/encoding; each camera has exactly
-one ffmpeg process (a V4L2 device can only be opened once) that tees
-its output to both a downscaled MJPEG preview and, while recording,
-the MP4 file — so live preview keeps working during a take.
+one ffmpeg process (a capture device can only be opened once) that
+tees its output to both a downscaled MJPEG preview and, while
+recording, the MP4 file — so live preview keeps working during a take.
+Cameras are discovered through the platform's native capture API: V4L2
+on Linux (the board, and Linux dev machines), DirectShow on Windows.
 
 ## Quick start (run locally, no install needed)
 
@@ -40,29 +42,69 @@ the MP4 file — so live preview keeps working during a take.
 ```
 
 Open `http://127.0.0.1:8080`. The script creates a virtualenv in
-`./.venv`, installs the Python dependencies, and starts the app with
-synthetic test-pattern cameras (`--simulate`), so the full UI —
-preview, recording, gallery, playback — can be exercised on any
-machine with `python3` and `ffmpeg` installed. Recordings and state
-are kept under `./.local/` inside the repo; nothing is written to
-`/opt`, `/etc` or `/var`. Delete `.venv` and `.local` to clean up.
+`./.venv`, installs the Python dependencies, and **records from
+whatever real cameras are attached** — a USB webcam, a laptop's
+built-in camera, a MIPI CSI sensor — exactly as it does on the board.
+Recordings and state are kept under `./.local/` inside the repo;
+nothing is written to `/opt`, `/etc` or `/var`. Delete `.venv` and
+`.local` to clean up.
 
-Options: `--port N`, `--host H`, `--real` (use actual V4L2 cameras
-instead of simulated ones). Any other arguments are passed through to
-`python -m lite_recorder`.
+If no camera is found, it falls back to synthetic test patterns so the
+UI can still be exercised, and says so both on the console and in a
+banner in the web UI — a run never *looks* like real footage when it
+isn't.
 
-**Windows / WSL note:** if the script fails with
-`: invalid option name: set: pipefail` (or `bash\r: bad interpreter`),
-the files were checked out with CRLF line endings by Git for Windows
-(`core.autocrlf=true`). `.gitattributes` now forces LF, so a fresh clone
-is fine; to fix an existing clone, run from the repo root:
+Camera options:
+
+- `--real` — real cameras only. No camera means no cameras in the UI
+  and a clear error when you press Record, instead of a silent fallback.
+- `--simulate` — synthetic test patterns only, no camera needed.
+- `--camera-mode auto|real|simulate` — the long form of the above
+  (`auto` is the default).
+
+Also `--port N` and `--host H`; any other arguments are passed through
+to `python -m lite_recorder`.
+
+**If you get test patterns when you expected your webcam**, the console
+output names the reason. On Linux/WSL, the usual ones:
+
+- No `/dev/video*` devices at all — nothing is plugged in, or (on WSL)
+  the webcam has not been attached to the Linux VM with `usbipd`.
+- Permission denied — add yourself to the `video` group with
+  `sudo usermod -aG video $USER`, then log out and back in.
+- The nodes exist but none is capture-capable — some devices expose
+  metadata-only nodes; check `v4l2-ctl --list-devices`.
+
+On Windows (native, via DirectShow):
+
+- No DirectShow video devices found — nothing is plugged in, or a
+  laptop's built-in camera is disabled in Device Manager.
+- A device is listed but reports no usable formats — check Windows
+  Settings → Privacy & security → Camera and allow desktop apps
+  access, and make sure no other app (Teams, OBS, the Camera app...)
+  already has it open.
+
+**Windows note:** run `scripts/run-local.sh` from Git Bash (not
+PowerShell/cmd — it's a bash script). Cameras are picked up natively
+through DirectShow, the same way OBS or Teams finds them; no WSL, no
+`usbipd`, no extra setup. WSL also works, but since WSL's Linux kernel
+has no native USB camera support, real capture there needs `usbipd`
+*and* a custom WSL kernel with the USB video class driver built in —
+running from Git Bash instead is far less work for the same result.
+
+If the script fails with `: invalid option name: set: pipefail` (or
+`bash\r: bad interpreter`), the files were checked out with CRLF line
+endings by Git for Windows (`core.autocrlf=true`). `.gitattributes` now
+forces LF, so a fresh clone is fine; to fix an existing clone, run from
+the repo root:
 
 ```
 git rm -r --cached -q . && git reset --hard
 ```
 
-Running the app from the Linux filesystem (e.g. `~/Lite-Recorder`)
-rather than `/mnt/c/...` also avoids this and is much faster.
+Under WSL specifically, running the app from the Linux filesystem
+(e.g. `~/Lite-Recorder`) rather than `/mnt/c/...` also avoids this and
+is much faster.
 
 Or by hand:
 
@@ -70,7 +112,8 @@ Or by hand:
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements-dev.txt
-python -m lite_recorder --simulate --port 8080
+python -m lite_recorder --port 8080          # real cameras, sim fallback
+python -m lite_recorder --real --port 8080  # real cameras only
 ```
 
 Run the test suite with `pytest` (requires `ffmpeg` on `PATH`).
@@ -168,22 +211,26 @@ onboard storage is too small. Nothing is ever auto-deleted.
   channel, country, static IP/DHCP range. See
   `config/ap.env.example`.
 - `/etc/lite-recorder/app.env` — app: recordings root, state dir,
-  host/port, `LITE_RECORDER_FORCE_ENCODER` (pin a specific encoder).
-  See `config/lite-recorder.env.example`.
+  host/port, `LITE_RECORDER_CAMERA_MODE` (`real` on the board, so a
+  missing camera is never quietly replaced by a test pattern),
+  `LITE_RECORDER_FORCE_ENCODER` (pin a specific encoder). See
+  `config/lite-recorder.env.example`.
 - `/var/lib/lite-recorder/cameras.json` — persisted per-camera
   label/resolution/fps/bitrate/enabled settings (managed by the UI).
 
 ## Encoder fallback
 
-On startup the app probes for `h264_rkmpp` (RK3588 hardware encoder),
-falling back to `h264_v4l2m2m`, then software `libx264` — and
-validates the chosen encoder with a real test encode, so a
-present-but-broken hardware path doesn't silently break every
-recording. If software encoding is in use, the web UI shows a
-persistent banner explaining why and warning that concurrent-camera
-capacity is reduced. Check `GET /api/system` for the current encoder
-status, or set `LITE_RECORDER_FORCE_ENCODER=libx264` to test the
-degraded path deliberately.
+On startup the app probes for a hardware H.264 encoder — `h264_rkmpp`
+(RK3588) then `h264_v4l2m2m` on Linux, or `h264_nvenc` (NVIDIA) then
+`h264_qsv` (Intel Quick Sync) then `h264_amf` (AMD) on Windows —
+falling back to software `libx264` if none work. It validates the
+chosen encoder with a real test encode, so a present-but-broken
+hardware path doesn't silently break every recording. If software
+encoding is in use, the web UI shows a persistent banner explaining
+why and warning that concurrent-camera capacity is reduced. Check
+`GET /api/system` for the current encoder status, or set
+`LITE_RECORDER_FORCE_ENCODER=libx264` to test the degraded path
+deliberately.
 
 ## Repository layout
 

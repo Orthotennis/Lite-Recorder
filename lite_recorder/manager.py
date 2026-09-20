@@ -13,7 +13,12 @@ from pathlib import Path
 
 from . import discovery
 from .camera import CameraSettings, CameraStatus, CameraWorker, STATE_ERROR
-from .config import CameraConfigStore, Settings
+from .config import (
+    CAMERA_MODE_REAL,
+    CAMERA_MODE_SIMULATE,
+    CameraConfigStore,
+    Settings,
+)
 from .encoder import EncoderInfo, select_encoder
 
 logger = logging.getLogger(__name__)
@@ -75,13 +80,53 @@ class CameraManager:
         self._workers: dict[str, CameraWorker] = {}
         self._devices: dict[str, discovery.CameraDevice] = {}
         self._session: RecordingSession | None = None
+        # Whether the cameras currently registered are synthetic, and why.
+        self.simulated: bool = settings.camera_mode == CAMERA_MODE_SIMULATE
+        self.camera_notice: str = ""
         self.rescan()
 
     # -- discovery / registry -------------------------------------------
 
+    def _collect_devices(self) -> list[discovery.CameraDevice]:
+        """Pick the device set for the configured camera mode.
+
+        `simulate` always uses test patterns; `real` always uses the
+        platform's real-camera backend (V4L2 on Linux, DirectShow on
+        Windows) and reports (rather than papers over) an empty scan;
+        `auto` records from
+        real cameras whenever any exist and only falls back to synthetic ones
+        with a visible explanation of why.
+        """
+        mode = self.settings.camera_mode
+        if mode == CAMERA_MODE_SIMULATE:
+            self.simulated = True
+            self.camera_notice = "Simulated cameras: recording synthetic test patterns, not live video."
+            return _simulated_devices()
+
+        report = discovery.discover_cameras_report()
+        if report.cameras:
+            self.simulated = False
+            self.camera_notice = ""
+            return report.cameras
+
+        reason = report.explain_empty()
+        if mode == CAMERA_MODE_REAL:
+            self.simulated = False
+            self.camera_notice = f"No cameras found — {reason}"
+            logger.warning("no cameras found in real mode: %s", reason)
+            return []
+
+        self.simulated = True
+        self.camera_notice = (
+            f"No real cameras found — {reason} Falling back to simulated cameras, "
+            "which record synthetic test patterns."
+        )
+        logger.warning("falling back to simulated cameras: %s", reason)
+        return _simulated_devices()
+
     def rescan(self) -> None:
         with self._lock:
-            devices = _simulated_devices() if self.settings.simulate else discovery.discover_cameras()
+            devices = self._collect_devices()
             seen_ids = set()
             for device in devices:
                 seen_ids.add(device.id)
@@ -104,7 +149,7 @@ class CameraManager:
                         ffmpeg_bin=self.settings.ffmpeg_bin,
                         preview_width=self.settings.preview_width,
                         preview_fps=self.settings.preview_fps,
-                        simulate=self.settings.simulate,
+                        simulate=self.simulated,
                     )
                     self._workers[device.id] = worker
                     worker.start_preview()
@@ -148,6 +193,10 @@ class CameraManager:
         with self._lock:
             if self._session is not None:
                 raise RuntimeError("recording already in progress")
+            if not any(w.settings.enabled for w in self._workers.values()):
+                raise RuntimeError(
+                    self.camera_notice or "no cameras are enabled for recording"
+                )
             now = time.time()
             dt = datetime.fromtimestamp(now)
             session_dir = (

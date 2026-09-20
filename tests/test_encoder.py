@@ -89,3 +89,42 @@ def test_select_encoder_nothing_works(monkeypatch):
     info = encoder.select_encoder("ffmpeg")
     assert info.degraded is True
     assert "No working encoder" in info.reason
+
+
+def test_build_input_args_dshow_mjpeg(monkeypatch):
+    monkeypatch.setattr(encoder.sys, "platform", "win32")
+    args = encoder.build_input_args("Integrated Webcam", "MJPG", 1280, 720, 30, simulate=False)
+    assert args == [
+        "-f", "dshow", "-vcodec", "mjpeg",
+        "-video_size", "1280x720", "-framerate", "30", "-i", "video=Integrated Webcam",
+    ]
+
+
+def test_build_input_args_dshow_yuyv(monkeypatch):
+    monkeypatch.setattr(encoder.sys, "platform", "win32")
+    args = encoder.build_input_args("Integrated Webcam", "YUYV422", 640, 480, 15, simulate=False)
+    assert "-pixel_format" in args
+    assert args[args.index("-pixel_format") + 1] == "yuyv422"
+    assert args[args.index("-i") + 1] == "video=Integrated Webcam"
+
+
+def test_select_encoder_tries_windows_hardware_encoders_first(monkeypatch):
+    monkeypatch.setattr(encoder.sys, "platform", "win32")
+    monkeypatch.setattr(encoder, "_list_available_encoders", lambda b: {"h264_nvenc", "libx264"})
+    monkeypatch.setattr(encoder, "_validate_encoder", lambda b, n: (True, ""))
+
+    info = encoder.select_encoder("ffmpeg")
+    assert info.name == "h264_nvenc"
+    assert info.kind == "hardware"
+    assert info.degraded is False
+
+
+def test_select_encoder_windows_falls_back_to_software(monkeypatch):
+    monkeypatch.setattr(encoder.sys, "platform", "win32")
+    monkeypatch.setattr(encoder, "_list_available_encoders", lambda b: {"libx264"})
+    monkeypatch.setattr(encoder, "_validate_encoder", lambda b, n: (True, ""))
+
+    info = encoder.select_encoder("ffmpeg")
+    assert info.name == "libx264"
+    assert info.kind == "software"
+    assert info.degraded is True
