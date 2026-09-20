@@ -136,6 +136,27 @@ This is the one setting that reliably needs adjusting per-board:
   ISO code) — required for legal channel/power selection, particularly
   if you ever move off the default 2.4 GHz channel 6.
 
+### Phone/laptop associates but never gets an IP
+
+If `sudo systemctl status hostapd.service` shows clients authenticating
+and associating but the client never gets an address (or
+`sudo systemctl status dnsmasq.service` shows `unknown interface
+<WIFI_IFACE>` / `FAILED to start up`), `dnsmasq` started before
+`hostapd` finished switching the radio into AP mode and raced the
+interface. `lite-recorder-ap.service` only orders itself before both
+`hostapd.service` and `dnsmasq.service`, not those two relative to each
+other, so a fresh install needs the `dnsmasq.service.d/lite-recorder.conf`
+drop-in (installed automatically by `install.sh`) that makes `dnsmasq`
+wait for `hostapd`. On an existing install missing it:
+
+```
+sudo mkdir -p /etc/systemd/system/dnsmasq.service.d
+sudo cp /opt/lite-recorder/systemd/dnsmasq.service.d/lite-recorder.conf \
+  /etc/systemd/system/dnsmasq.service.d/
+sudo systemctl daemon-reload
+sudo systemctl restart hostapd.service dnsmasq.service
+```
+
 ### Enabling the CSI cameras
 
 MIPI CSI sensors need their device-tree overlay enabled before
