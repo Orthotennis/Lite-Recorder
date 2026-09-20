@@ -90,8 +90,10 @@ class CameraManager:
     def _collect_devices(self) -> list[discovery.CameraDevice]:
         """Pick the device set for the configured camera mode.
 
-        `simulate` always uses test patterns; `real` always uses V4L2 and
-        reports (rather than papers over) an empty scan; `auto` records from
+        `simulate` always uses test patterns; `real` always uses the
+        platform's real-camera backend (V4L2 on Linux, DirectShow on
+        Windows) and reports (rather than papers over) an empty scan;
+        `auto` records from
         real cameras whenever any exist and only falls back to synthetic ones
         with a visible explanation of why.
         """

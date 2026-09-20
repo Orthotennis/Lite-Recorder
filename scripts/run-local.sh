@@ -6,13 +6,15 @@
 #   ./scripts/run-local.sh --real       # fail loudly if no real camera is found
 #   ./scripts/run-local.sh --simulate   # synthetic test-pattern cameras
 #
-# By default it records from whatever V4L2 cameras (USB webcam, MIPI CSI)
-# are attached, and only falls back to synthetic test patterns if none are
-# found -- saying so on the console and in the web UI.
+# By default it records from whatever cameras are attached -- V4L2 (USB
+# webcam, MIPI CSI) on Linux, or DirectShow (USB webcam, built-in laptop
+# camera) on Windows -- and only falls back to synthetic test patterns if
+# none are found, saying so on the console and in the web UI.
 #
 # Nothing touches /opt, /etc or /var: the Python virtualenv lives in
 # ./.venv and recordings/state live in ./.local (both git-ignored).
-# Requires python3 (with the venv module) and ffmpeg on PATH.
+# Requires python3 (with the venv module) and ffmpeg on PATH. On Windows,
+# run this from Git Bash (or WSL, where cameras need usbipd -- see below).
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -32,7 +34,7 @@ while [[ $# -gt 0 ]]; do
     --host) HOST="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     -h|--help)
-      sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) EXTRA_ARGS+=("$1"); shift ;;
   esac
@@ -53,27 +55,53 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
 fi
 
 # Report what the app is about to find, so "why am I seeing test patterns?"
-# is answered before the browser is even open.
+# is answered before the browser is even open. Windows (via Git Bash, where
+# $OSTYPE is msys*/cygwin*) has no /dev/video* nodes at all -- cameras are
+# enumerated through ffmpeg's own DirectShow device listing instead, the
+# same way lite_recorder's Windows discovery backend does it.
 if [[ "$CAMERA_MODE" != simulate ]]; then
-  VIDEO_NODES=(/dev/video*)
-  if [[ ! -e "${VIDEO_NODES[0]}" ]]; then
-    echo "==> No /dev/video* devices found."
-    if [[ "$CAMERA_MODE" == real ]]; then
-      echo "    --real was requested, so no cameras will be available." >&2
-      echo "    Plug in a USB webcam (under WSL, attach it with usbipd) and retry." >&2
+  if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]]; then
+    DSHOW_DEVICES="$(ffmpeg -hide_banner -f dshow -list_devices true -i dummy 2>&1 || true)"
+    VIDEO_NAMES="$(printf '%s\n' "$DSHOW_DEVICES" | awk '
+      /DirectShow video devices/ {invideo=1; next}
+      /DirectShow audio devices/ {invideo=0}
+      invideo && /^\[dshow[^]]*\]  "/ { sub(/^\[dshow[^]]*\]  /, ""); print }
+    ')"
+    if [[ -z "$VIDEO_NAMES" ]]; then
+      echo "==> No DirectShow video devices found."
+      if [[ "$CAMERA_MODE" == real ]]; then
+        echo "    --real was requested, so no cameras will be available." >&2
+        echo "    Plug in a USB webcam and retry, or check Windows Settings >" >&2
+        echo "    Privacy & security > Camera for desktop-app access." >&2
+      else
+        echo "    Falling back to simulated cameras (synthetic test patterns)."
+        echo "    Plug in a USB webcam and rerun for real capture."
+      fi
     else
-      echo "    Falling back to simulated cameras (synthetic test patterns)."
-      echo "    Plug in a USB webcam and rerun for real capture."
+      echo "==> Video devices:"
+      printf '    %s\n' "$VIDEO_NAMES"
     fi
   else
-    echo "==> Video devices: ${VIDEO_NODES[*]}"
-    UNREADABLE=()
-    for node in "${VIDEO_NODES[@]}"; do
-      [[ -r "$node" && -w "$node" ]] || UNREADABLE+=("$node")
-    done
-    if [[ ${#UNREADABLE[@]} -gt 0 ]]; then
-      echo "    Not readable/writable by $(id -un): ${UNREADABLE[*]}"
-      echo "    Fix with: sudo usermod -aG video $(id -un)   (then log out and back in)"
+    VIDEO_NODES=(/dev/video*)
+    if [[ ! -e "${VIDEO_NODES[0]}" ]]; then
+      echo "==> No /dev/video* devices found."
+      if [[ "$CAMERA_MODE" == real ]]; then
+        echo "    --real was requested, so no cameras will be available." >&2
+        echo "    Plug in a USB webcam (under WSL, attach it with usbipd) and retry." >&2
+      else
+        echo "    Falling back to simulated cameras (synthetic test patterns)."
+        echo "    Plug in a USB webcam and rerun for real capture."
+      fi
+    else
+      echo "==> Video devices: ${VIDEO_NODES[*]}"
+      UNREADABLE=()
+      for node in "${VIDEO_NODES[@]}"; do
+        [[ -r "$node" && -w "$node" ]] || UNREADABLE+=("$node")
+      done
+      if [[ ${#UNREADABLE[@]} -gt 0 ]]; then
+        echo "    Not readable/writable by $(id -un): ${UNREADABLE[*]}"
+        echo "    Fix with: sudo usermod -aG video $(id -un)   (then log out and back in)"
+      fi
     fi
   fi
 fi
