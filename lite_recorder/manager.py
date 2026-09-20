@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import discovery
-from .camera import CameraSettings, CameraStatus, CameraWorker, STATE_ERROR
+from .camera import CameraSettings, CameraStatus, CameraWorker, STATE_ERROR, STATE_RECORDING
 from .config import CameraConfigStore, Settings
 from .encoder import EncoderInfo, select_encoder
 
@@ -110,8 +110,19 @@ class CameraManager:
                     worker.start_preview()
                 else:
                     worker = self._workers[device.id]
+                    # The stable id (by-id/by-path symlink) survives
+                    # replug/renumbering, but the underlying /dev/videoN
+                    # it resolves to can change (e.g. plugging in another
+                    # camera shifts kernel numbering) - refresh it, or the
+                    # worker keeps launching ffmpeg against a stale node
+                    # that now belongs to a different camera's process
+                    # (surfacing as a persistent "Device or resource busy").
+                    device_node_changed = worker.device.device_node != device.device_node
+                    worker.device = device
                     worker.settings = cam_settings
-                    if worker.state == STATE_ERROR:
+                    if worker.state == STATE_ERROR or (
+                        device_node_changed and worker.state != STATE_RECORDING
+                    ):
                         worker.start_preview()
 
             # Drop workers for cameras that disappeared (e.g. unplugged).

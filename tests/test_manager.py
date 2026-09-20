@@ -2,6 +2,7 @@ import time
 
 import pytest
 
+from lite_recorder import manager as manager_mod
 from lite_recorder.config import Settings
 from lite_recorder.manager import CameraManager, slugify
 
@@ -30,6 +31,32 @@ def test_rescan_populates_simulated_cameras(manager):
     cams = manager.list_cameras()
     assert len(cams) == 4
     assert {c.state for c in cams} == {"preview"}
+
+
+def test_rescan_refreshes_stale_device_node(manager, monkeypatch):
+    """A camera's stable id (by-id/by-path) survives replug, but the
+    /dev/videoN it resolves to can change (e.g. plugging in another
+    camera shifts kernel numbering). rescan() must update the worker's
+    device, or it keeps launching ffmpeg against a stale node that may
+    now belong to a different camera's already-running process."""
+    cams = manager.list_cameras()
+    cam_id = cams[0].id
+    worker = manager.get_worker(cam_id)
+    original_node = worker.device.device_node
+
+    original_simulated = manager_mod._simulated_devices
+
+    def renumbered(count: int = 4):
+        devices = original_simulated(count)
+        for device in devices:
+            if device.id == cam_id:
+                device.device_node = original_node + "-renumbered"
+        return devices
+
+    monkeypatch.setattr(manager_mod, "_simulated_devices", renumbered)
+    manager.rescan()
+
+    assert worker.device.device_node == original_node + "-renumbered"
 
 
 def test_update_camera_persists_label(manager):
