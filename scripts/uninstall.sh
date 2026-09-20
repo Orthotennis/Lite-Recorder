@@ -56,6 +56,8 @@ systemctl disable lite-recorder.service lite-recorder-ap.service 2>/dev/null || 
 echo "==> Removing systemd unit files"
 rm -f /etc/systemd/system/lite-recorder.service
 rm -f /etc/systemd/system/lite-recorder-ap.service
+rm -f /etc/systemd/system/dnsmasq.service.d/lite-recorder.conf
+rmdir --ignore-fail-on-non-empty /etc/systemd/system/dnsmasq.service.d 2>/dev/null || true
 systemctl daemon-reload 2>/dev/null || true
 systemctl reset-failed 2>/dev/null || true
 

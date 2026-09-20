@@ -54,6 +54,8 @@ chmod +x "$INSTALL_DIR/scripts/"*.sh
 echo "==> Installing systemd units"
 cp "$INSTALL_DIR/systemd/lite-recorder-ap.service" /etc/systemd/system/
 cp "$INSTALL_DIR/systemd/lite-recorder.service" /etc/systemd/system/
+mkdir -p /etc/systemd/system/dnsmasq.service.d
+cp "$INSTALL_DIR/systemd/dnsmasq.service.d/lite-recorder.conf" /etc/systemd/system/dnsmasq.service.d/
 systemctl daemon-reload
 systemctl enable lite-recorder-ap.service lite-recorder.service
 

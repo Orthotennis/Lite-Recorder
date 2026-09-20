@@ -136,6 +136,62 @@ This is the one setting that reliably needs adjusting per-board:
   ISO code) — required for legal channel/power selection, particularly
   if you ever move off the default 2.4 GHz channel 6.
 
+### Phone/laptop associates but never gets an IP
+
+If `sudo systemctl status hostapd.service` shows clients authenticating
+and associating but the client never gets an address (or
+`sudo systemctl status dnsmasq.service` shows `unknown interface
+<WIFI_IFACE>` / `FAILED to start up`), `dnsmasq` started before
+`hostapd` finished switching the radio into AP mode and raced the
+interface. `lite-recorder-ap.service` only orders itself before both
+`hostapd.service` and `dnsmasq.service`, not those two relative to each
+other, so a fresh install needs the `dnsmasq.service.d/lite-recorder.conf`
+drop-in (installed automatically by `install.sh`) that makes `dnsmasq`
+wait for `hostapd`. On an existing install missing it:
+
+```
+sudo mkdir -p /etc/systemd/system/dnsmasq.service.d
+sudo cp /opt/lite-recorder/systemd/dnsmasq.service.d/lite-recorder.conf \
+  /etc/systemd/system/dnsmasq.service.d/
+sudo systemctl daemon-reload
+sudo systemctl restart hostapd.service dnsmasq.service
+```
+
+If that alone doesn't fix it and `dnsmasq` still reports `unknown
+interface <WIFI_IFACE>` even when run standalone
+(`sudo dnsmasq --no-daemon --conf-file=/etc/dnsmasq.d/lite-recorder.conf`)
+well after `hostapd` is confirmed running, check whether
+NetworkManager still owns the interface:
+
+```
+nmcli device status
+```
+
+If `WIFI_IFACE` shows as `wifi` / `connected` or `disconnected`
+(**managed**) rather than `unmanaged`, NetworkManager is able to grab
+and reset the interface out from under `hostapd` after boot. This
+happens because `ap-up.sh` runs at `network-pre.target`, before
+NetworkManager has necessarily started, so its runtime
+`nmcli device set managed no` call can silently fail
+(`Could not create NMClient object`) - NetworkManager then takes the
+interface once it starts. `ap-up.sh` now also writes a persistent
+`/etc/NetworkManager/conf.d/lite-recorder.conf` marking the interface
+unmanaged, which isn't racy against NetworkManager's own startup order.
+On an existing install missing that fix, apply it manually:
+
+```
+sudo tee /etc/NetworkManager/conf.d/lite-recorder.conf <<'EOF'
+[keyfile]
+unmanaged-devices=interface-name:WIFI_IFACE
+EOF
+sudo systemctl reload-or-restart NetworkManager.service
+sudo systemctl restart hostapd.service dnsmasq.service
+```
+
+(replace `WIFI_IFACE` with the actual interface name from
+`/etc/lite-recorder/ap.env`), then confirm with `nmcli device status`
+that it now shows `unmanaged`.
+
 ### Enabling the CSI cameras
 
 MIPI CSI sensors need their device-tree overlay enabled before
