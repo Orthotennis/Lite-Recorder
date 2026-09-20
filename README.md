@@ -157,6 +157,41 @@ sudo systemctl daemon-reload
 sudo systemctl restart hostapd.service dnsmasq.service
 ```
 
+If that alone doesn't fix it and `dnsmasq` still reports `unknown
+interface <WIFI_IFACE>` even when run standalone
+(`sudo dnsmasq --no-daemon --conf-file=/etc/dnsmasq.d/lite-recorder.conf`)
+well after `hostapd` is confirmed running, check whether
+NetworkManager still owns the interface:
+
+```
+nmcli device status
+```
+
+If `WIFI_IFACE` shows as `wifi` / `connected` or `disconnected`
+(**managed**) rather than `unmanaged`, NetworkManager is able to grab
+and reset the interface out from under `hostapd` after boot. This
+happens because `ap-up.sh` runs at `network-pre.target`, before
+NetworkManager has necessarily started, so its runtime
+`nmcli device set managed no` call can silently fail
+(`Could not create NMClient object`) - NetworkManager then takes the
+interface once it starts. `ap-up.sh` now also writes a persistent
+`/etc/NetworkManager/conf.d/lite-recorder.conf` marking the interface
+unmanaged, which isn't racy against NetworkManager's own startup order.
+On an existing install missing that fix, apply it manually:
+
+```
+sudo tee /etc/NetworkManager/conf.d/lite-recorder.conf <<'EOF'
+[keyfile]
+unmanaged-devices=interface-name:WIFI_IFACE
+EOF
+sudo systemctl reload-or-restart NetworkManager.service
+sudo systemctl restart hostapd.service dnsmasq.service
+```
+
+(replace `WIFI_IFACE` with the actual interface name from
+`/etc/lite-recorder/ap.env`), then confirm with `nmcli device status`
+that it now shows `unmanaged`.
+
 ### Enabling the CSI cameras
 
 MIPI CSI sensors need their device-tree overlay enabled before

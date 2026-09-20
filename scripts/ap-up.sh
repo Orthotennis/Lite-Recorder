@@ -59,9 +59,22 @@ echo "ap-up.sh: unblocking rfkill and preparing $WIFI_IFACE"
 rfkill unblock wifi || true
 
 # Take the interface away from NetworkManager (if present) so it doesn't
-# fight hostapd for control of it.
-if command -v nmcli >/dev/null 2>&1; then
-  nmcli device set "$WIFI_IFACE" managed no || true
+# fight hostapd/dnsmasq for control of it. This script runs at
+# network-pre.target, before NetworkManager has necessarily started, so a
+# runtime `nmcli device set managed no` call can silently fail here
+# ("Could not create NMClient object") and NetworkManager will grab the
+# interface once it does start - resetting it out from under hostapd and
+# leaving dnsmasq unable to see it. Writing a persistent NetworkManager
+# config instead means the interface is unmanaged no matter which of the
+# two starts first.
+if [[ -d /etc/NetworkManager/conf.d ]]; then
+  cat > /etc/NetworkManager/conf.d/lite-recorder.conf <<EOF
+[keyfile]
+unmanaged-devices=interface-name:${WIFI_IFACE}
+EOF
+  if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager.service 2>/dev/null; then
+    nmcli general reload conf 2>/dev/null || systemctl reload-or-restart NetworkManager.service 2>/dev/null || true
+  fi
 fi
 
 ip link set "$WIFI_IFACE" down || true
