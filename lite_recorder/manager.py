@@ -109,7 +109,10 @@ class CameraManager:
                     self._workers[device.id] = worker
                     worker.start_preview()
                 else:
-                    self._workers[device.id].settings = cam_settings
+                    worker = self._workers[device.id]
+                    worker.settings = cam_settings
+                    if worker.state == STATE_ERROR:
+                        worker.start_preview()
 
             # Drop workers for cameras that disappeared (e.g. unplugged).
             for gone_id in set(self._workers) - seen_ids:

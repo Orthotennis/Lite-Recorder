@@ -92,6 +92,10 @@ class CameraWorker:
         self._last_frame_at = 0.0
         self._stopping = False
 
+        self._retry_timer: threading.Timer | None = None
+        self._retry_delay = 2.0
+        self._retry_delay_max = 30.0
+
     # -- public API ---------------------------------------------------
 
     @property
@@ -136,6 +140,7 @@ class CameraWorker:
     def stop(self) -> None:
         """Fully stop this camera's ffmpeg process."""
         self._stopping = True
+        self._cancel_retry()
         self._terminate_process()
         with self._lock:
             self._state = STATE_IDLE
@@ -143,8 +148,21 @@ class CameraWorker:
 
     # -- internals ------------------------------------------------------
 
-    def _spawn(self, record_path: Path | None, encoder: encoder_mod.EncoderInfo | None = None) -> None:
+    def _cancel_retry(self) -> None:
+        if self._retry_timer is not None:
+            self._retry_timer.cancel()
+            self._retry_timer = None
+
+    def _spawn(
+        self,
+        record_path: Path | None,
+        encoder: encoder_mod.EncoderInfo | None = None,
+        is_retry: bool = False,
+    ) -> None:
         self._stopping = False
+        self._cancel_retry()
+        if not is_retry:
+            self._retry_delay = 2.0
         self._terminate_process()
 
         fmt = self._select_format()
@@ -247,6 +265,7 @@ class CameraWorker:
 
     def _watch_exit(self, proc: subprocess.Popen) -> None:
         proc.wait()
+        should_retry = False
         with self._lock:
             if self._proc is not proc:
                 return  # superseded by a newer process
@@ -257,6 +276,29 @@ class CameraWorker:
                 self._state = STATE_ERROR
                 self._error = "\n".join(self._stderr_tail) or f"ffmpeg exited with code {proc.returncode}"
                 logger.warning("camera %s: ffmpeg exited unexpectedly: %s", self.device.id, self._error)
+                # Only auto-retry preview failures (e.g. a transient "Device
+                # or resource busy" while another process is still releasing
+                # the node) - never silently restart a failed recording.
+                should_retry = self._recording_path is None
+        if should_retry:
+            self._schedule_retry()
+
+    def _schedule_retry(self) -> None:
+        delay = self._retry_delay
+        self._retry_delay = min(self._retry_delay * 2, self._retry_delay_max)
+        logger.info("camera %s: retrying preview in %.0fs", self.device.id, delay)
+        timer = threading.Timer(delay, self._retry_preview)
+        timer.daemon = True
+        self._retry_timer = timer
+        timer.start()
+
+    def _retry_preview(self) -> None:
+        if self._stopping:
+            return
+        with self._lock:
+            if self._state != STATE_ERROR:
+                return
+        self._spawn(record_path=None, is_retry=True)
 
     def _terminate_process(self) -> None:
         proc = self._proc
