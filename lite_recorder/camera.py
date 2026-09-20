@@ -78,6 +78,14 @@ class CameraWorker:
         self._simulate = simulate
 
         self._lock = threading.Lock()
+        # Serializes the whole terminate-then-launch sequence. Without it a
+        # retry timer that has already started running (so _cancel_retry can
+        # no longer stop it) can race a rescan/user action and put two ffmpeg
+        # processes on the same /dev/videoN - the loser dies with "Device or
+        # resource busy" and schedules another retry, looping indefinitely.
+        self._spawn_lock = threading.RLock()
+        self._spawn_seq = 0
+        self._closed = False
         self._proc: subprocess.Popen | None = None
         self._stdout_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
@@ -137,14 +145,23 @@ class CameraWorker:
         """Drop back to preview-only (keeps the camera live)."""
         self._spawn(record_path=None)
 
+    def release(self) -> None:
+        """Terminate the ffmpeg process and free the device node, leaving
+        the worker reusable (used when a camera's /dev/videoN is being
+        reassigned and must be released before anything re-opens it)."""
+        with self._spawn_lock:
+            self._stopping = True
+            self._cancel_retry()
+            self._terminate_process()
+            with self._lock:
+                self._state = STATE_IDLE
+                self._recording_path = None
+
     def stop(self) -> None:
-        """Fully stop this camera's ffmpeg process."""
-        self._stopping = True
-        self._cancel_retry()
-        self._terminate_process()
-        with self._lock:
-            self._state = STATE_IDLE
-            self._recording_path = None
+        """Permanently stop this camera's ffmpeg process."""
+        with self._spawn_lock:
+            self._closed = True
+            self.release()
 
     # -- internals ------------------------------------------------------
 
@@ -158,7 +175,27 @@ class CameraWorker:
         record_path: Path | None,
         encoder: encoder_mod.EncoderInfo | None = None,
         is_retry: bool = False,
+        retry_seq: int | None = None,
     ) -> None:
+        with self._spawn_lock:
+            self._spawn_locked(record_path, encoder, is_retry, retry_seq)
+
+    def _spawn_locked(
+        self,
+        record_path: Path | None,
+        encoder: encoder_mod.EncoderInfo | None,
+        is_retry: bool,
+        retry_seq: int | None,
+    ) -> None:
+        if self._closed:
+            return
+        with self._lock:
+            # A retry timer that had already started running when a newer
+            # spawn took over must not launch a second ffmpeg on this node.
+            if retry_seq is not None and retry_seq != self._spawn_seq:
+                logger.debug("camera %s: discarding superseded retry", self.device.id)
+                return
+            self._spawn_seq += 1
         self._stopping = False
         self._cancel_retry()
         if not is_retry:
@@ -286,25 +323,28 @@ class CameraWorker:
     def _schedule_retry(self) -> None:
         delay = self._retry_delay
         self._retry_delay = min(self._retry_delay * 2, self._retry_delay_max)
+        with self._lock:
+            seq = self._spawn_seq
         logger.info("camera %s: retrying preview in %.0fs", self.device.id, delay)
-        timer = threading.Timer(delay, self._retry_preview)
+        timer = threading.Timer(delay, self._retry_preview, args=(seq,))
         timer.daemon = True
         self._retry_timer = timer
         timer.start()
 
-    def _retry_preview(self) -> None:
-        if self._stopping:
+    def _retry_preview(self, seq: int) -> None:
+        if self._stopping or self._closed:
             return
         with self._lock:
-            if self._state != STATE_ERROR:
+            if self._state != STATE_ERROR or seq != self._spawn_seq:
                 return
-        self._spawn(record_path=None, is_retry=True)
+        self._spawn(record_path=None, is_retry=True, retry_seq=seq)
 
     def _terminate_process(self) -> None:
-        proc = self._proc
+        with self._lock:
+            proc = self._proc
+            self._proc = None
         if proc is None:
             return
-        self._proc = None
         if proc.poll() is not None:
             return
         try:

@@ -59,6 +59,102 @@ def test_rescan_refreshes_stale_device_node(manager, monkeypatch):
     assert worker.device.device_node == original_node + "-renumbered"
 
 
+def test_rescan_releases_node_before_reassigning_it(manager, monkeypatch):
+    """Two cameras can swap /dev/videoN across a replug. The worker losing
+    a node must release it before the worker gaining it re-opens it, or the
+    second open fails with EBUSY."""
+    cams = manager.list_cameras()
+    a_id, b_id = cams[0].id, cams[1].id
+    worker_a, worker_b = manager.get_worker(a_id), manager.get_worker(b_id)
+    node_a, node_b = worker_a.device.device_node, worker_b.device.device_node
+
+    events = []
+    for worker, name in ((worker_a, "a"), (worker_b, "b")):
+        monkeypatch.setattr(
+            worker, "release", lambda n=name: events.append(("release", n))
+        )
+        monkeypatch.setattr(
+            worker, "start_preview", lambda n=name: events.append(("start", n))
+        )
+
+    original_simulated = manager_mod._simulated_devices
+
+    def swapped(count: int = 4):
+        devices = original_simulated(count)
+        for device in devices:
+            if device.id == a_id:
+                device.device_node = node_b
+            elif device.id == b_id:
+                device.device_node = node_a
+        return devices
+
+    monkeypatch.setattr(manager_mod, "_simulated_devices", swapped)
+    manager.rescan()
+
+    assert worker_a.device.device_node == node_b
+    assert worker_b.device.device_node == node_a
+    # Both nodes released before either is re-opened.
+    assert events.index(("release", "a")) < events.index(("start", "a"))
+    assert events.index(("release", "a")) < events.index(("start", "b"))
+    assert events.index(("release", "b")) < events.index(("start", "a"))
+    assert events.index(("release", "b")) < events.index(("start", "b"))
+
+
+def test_rescan_does_not_restart_recording_camera(manager, monkeypatch):
+    cams = manager.list_cameras()
+    cam_id = cams[0].id
+    worker = manager.get_worker(cam_id)
+    node = worker.device.device_node
+
+    monkeypatch.setattr(worker, "_state", "recording")
+    calls = []
+    monkeypatch.setattr(worker, "release", lambda: calls.append("release"))
+    monkeypatch.setattr(worker, "start_preview", lambda: calls.append("start"))
+
+    original_simulated = manager_mod._simulated_devices
+
+    def renumbered(count: int = 4):
+        devices = original_simulated(count)
+        for device in devices:
+            if device.id == cam_id:
+                device.device_node = node + "-renumbered"
+        return devices
+
+    monkeypatch.setattr(manager_mod, "_simulated_devices", renumbered)
+    manager.rescan()
+
+    assert calls == []
+
+
+def test_update_camera_label_does_not_restart_capture(manager, monkeypatch):
+    """The UI PATCHes every field on any edit; renaming a live camera must
+    not tear down and re-open its device."""
+    cams = manager.list_cameras()
+    cam_id = cams[0].id
+    worker = manager.get_worker(cam_id)
+    monkeypatch.setattr(worker, "_state", "preview")
+
+    restarts = []
+    monkeypatch.setattr(worker, "start_preview", lambda: restarts.append(1))
+
+    manager.update_camera(
+        cam_id,
+        {
+            "label": "renamed",
+            "width": worker.settings.width,
+            "height": worker.settings.height,
+            "fps": worker.settings.fps,
+            "bitrate_kbps": 4000,
+            "enabled": True,
+        },
+    )
+    assert restarts == []
+    assert worker.settings.label == "renamed"
+
+    manager.update_camera(cam_id, {"width": worker.settings.width + 160})
+    assert len(restarts) == 1
+
+
 def test_update_camera_persists_label(manager):
     cams = manager.list_cameras()
     cam_id = cams[0].id

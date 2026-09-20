@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 
 _SLUG_RE = re.compile(r"[^a-zA-Z0-9_-]+")
 
+# Settings that change how the device itself is opened; anything else
+# (label, enabled, bitrate) can be applied without restarting capture.
+_CAPTURE_FIELDS = {"width", "height", "fps", "pixel_format"}
+
 
 def slugify(label: str) -> str:
     slug = _SLUG_RE.sub("-", label.strip()).strip("-")
@@ -79,25 +83,35 @@ class CameraManager:
 
     # -- discovery / registry -------------------------------------------
 
+    def _settings_for(self, device: discovery.CameraDevice) -> CameraSettings:
+        stored = self.config_store.get(device.id)
+        default_fmt = device.best_effort_default_format()
+        return CameraSettings(
+            label=stored.get("label", device.id),
+            width=stored.get("width", default_fmt.width if default_fmt else 1280),
+            height=stored.get("height", default_fmt.height if default_fmt else 720),
+            fps=stored.get("fps", int(default_fmt.framerates[0]) if default_fmt and default_fmt.framerates else 30),
+            pixel_format=stored.get("pixel_format", default_fmt.pixel_format if default_fmt else "MJPG"),
+            bitrate_kbps=stored.get("bitrate_kbps", 4000),
+            enabled=stored.get("enabled", True),
+        )
+
     def rescan(self) -> None:
         with self._lock:
-            devices = _simulated_devices() if self.settings.simulate else discovery.discover_cameras()
+            if self.settings.simulate:
+                devices = _simulated_devices()
+            else:
+                devices = discovery.discover_cameras(
+                    known={d.device_node: d for d in self._devices.values()}
+                )
             seen_ids = set()
+            to_start: list[CameraWorker] = []
             for device in devices:
                 seen_ids.add(device.id)
-                stored = self.config_store.get(device.id)
-                default_fmt = device.best_effort_default_format()
-                cam_settings = CameraSettings(
-                    label=stored.get("label", device.id),
-                    width=stored.get("width", default_fmt.width if default_fmt else 1280),
-                    height=stored.get("height", default_fmt.height if default_fmt else 720),
-                    fps=stored.get("fps", int(default_fmt.framerates[0]) if default_fmt and default_fmt.framerates else 30),
-                    pixel_format=stored.get("pixel_format", default_fmt.pixel_format if default_fmt else "MJPG"),
-                    bitrate_kbps=stored.get("bitrate_kbps", 4000),
-                    enabled=stored.get("enabled", True),
-                )
+                cam_settings = self._settings_for(device)
                 self._devices[device.id] = device
-                if device.id not in self._workers:
+                worker = self._workers.get(device.id)
+                if worker is None:
                     worker = CameraWorker(
                         device=device,
                         settings=cam_settings,
@@ -107,29 +121,40 @@ class CameraManager:
                         simulate=self.settings.simulate,
                     )
                     self._workers[device.id] = worker
-                    worker.start_preview()
-                else:
-                    worker = self._workers[device.id]
-                    # The stable id (by-id/by-path symlink) survives
-                    # replug/renumbering, but the underlying /dev/videoN
-                    # it resolves to can change (e.g. plugging in another
-                    # camera shifts kernel numbering) - refresh it, or the
-                    # worker keeps launching ffmpeg against a stale node
-                    # that now belongs to a different camera's process
-                    # (surfacing as a persistent "Device or resource busy").
-                    device_node_changed = worker.device.device_node != device.device_node
-                    worker.device = device
-                    worker.settings = cam_settings
-                    if worker.state == STATE_ERROR or (
-                        device_node_changed and worker.state != STATE_RECORDING
-                    ):
-                        worker.start_preview()
+                    to_start.append(worker)
+                    continue
+
+                # The stable id (by-id/by-path symlink) survives
+                # replug/renumbering, but the underlying /dev/videoN it
+                # resolves to can change (e.g. plugging in another camera
+                # shifts kernel numbering) - refresh it, or the worker keeps
+                # launching ffmpeg against a stale node that now belongs to
+                # a different camera's process (surfacing as a persistent
+                # "Device or resource busy").
+                node_changed = worker.device.device_node != device.device_node
+                worker.device = device
+                worker.settings = cam_settings
+                if worker.state == STATE_RECORDING:
+                    continue
+                if node_changed:
+                    # Release the old node up front: two cameras can swap
+                    # /dev/videoN, and re-opening one while the other still
+                    # holds its former node fails with EBUSY.
+                    worker.release()
+                    to_start.append(worker)
+                elif worker.state == STATE_ERROR:
+                    to_start.append(worker)
 
             # Drop workers for cameras that disappeared (e.g. unplugged).
             for gone_id in set(self._workers) - seen_ids:
                 self._workers[gone_id].stop()
                 del self._workers[gone_id]
                 del self._devices[gone_id]
+
+            # Every reassigned node has been released by now, so these can
+            # open their new nodes without racing each other.
+            for worker in to_start:
+                worker.start_preview()
 
     def list_cameras(self) -> list[CameraStatus]:
         with self._lock:
@@ -142,10 +167,19 @@ class CameraManager:
                 raise KeyError(camera_id)
             allowed = {"label", "width", "height", "fps", "pixel_format", "bitrate_kbps", "enabled"}
             clean_patch = {k: v for k, v in patch.items() if k in allowed}
+            changed = {
+                k for k, v in clean_patch.items() if getattr(worker.settings, k) != v
+            }
             self.config_store.update(camera_id, clean_patch)
             for key, value in clean_patch.items():
                 setattr(worker.settings, key, value)
-            if worker.state != "recording":
+            # Only a capture-format change actually requires re-opening the
+            # device. The UI PATCHes every field on any edit, so restarting
+            # unconditionally tore down and re-opened a live camera just to
+            # rename it - needless churn, and every re-open is a chance to
+            # lose the race for the device node.
+            needs_restart = bool(changed & _CAPTURE_FIELDS) or worker.state == STATE_ERROR
+            if needs_restart and worker.state != STATE_RECORDING:
                 worker.start_preview()
             return worker.status()
 
