@@ -192,6 +192,29 @@ sudo systemctl restart hostapd.service dnsmasq.service
 `/etc/lite-recorder/ap.env`), then confirm with `nmcli device status`
 that it now shows `unmanaged`.
 
+### A camera shows "Device or resource busy"
+
+Each camera is opened by exactly one ffmpeg process, so this means
+something else already holds that `/dev/videoN`. The app handles the
+cases it can cause itself — a camera's node being renumbered when
+another camera is plugged in, a rescan racing an automatic retry, and a
+node that refuses a second `open()` while it is being captured — and
+retries a failed preview with backoff, so a transient conflict clears on
+its own.
+
+If it persists, the holder is outside the app. Check with:
+
+```
+sudo fuser -v /dev/video*
+```
+
+If that names a process (another capture tool, a leftover `ffmpeg` from
+a killed run), stop it. If nothing holds the node, suspect USB
+bandwidth rather than contention: several cameras on one controller at
+high resolution/framerate can fail to start. Confirm by lowering the
+resolution or framerate for the affected cameras in the UI, and prefer
+spreading cameras across separate USB controllers over a single hub.
+
 ### Enabling the CSI cameras
 
 MIPI CSI sensors need their device-tree overlay enabled before

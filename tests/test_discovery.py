@@ -1,6 +1,8 @@
 import struct
 from unittest import mock
 
+import pytest
+
 from lite_recorder import discovery
 
 
@@ -34,14 +36,25 @@ class FakeV4L2Node:
                 discovery._FMTDESC_FMT, index, 1, 0, b"\x00" * 32, discovery._str_to_fourcc(pf_str), 0
             )
         if request == discovery.VIDIOC_ENUM_FRAMESIZES:
-            (index, pf, _type, _w, _h) = struct.unpack(discovery._FRMSIZE_FMT, buf)
+            # v4l2_frmsizeenum: index, pixel_format, type, then a 6-u32
+            # union (discrete uses the first two as width/height).
+            (index, pf, _type, *_union) = struct.unpack(discovery._FRMSIZE_FMT, buf)
             pf_str = discovery._fourcc_to_str(pf)
             sizes = next((sizes for name, sizes in self.formats if name == pf_str), [])
             if index >= len(sizes):
                 raise OSError("EINVAL")
             w, h, _rates = sizes[index]
             return struct.pack(
-                discovery._FRMSIZE_FMT, index, pf, discovery.V4L2_FRMSIZE_TYPE_DISCRETE, w, h
+                discovery._FRMSIZE_FMT,
+                index,
+                pf,
+                discovery.V4L2_FRMSIZE_TYPE_DISCRETE,
+                w,
+                h,
+                0,
+                0,
+                0,
+                0,
             )
         if request == discovery.VIDIOC_ENUM_FRAMEINTERVALS:
             (index, pf, w, h, _type, _n, _d) = struct.unpack(discovery._FRMIVAL_FMT, buf)
@@ -110,6 +123,41 @@ def test_probe_device_handles_open_failure():
     with mock.patch("os.open", side_effect=OSError("no such device")):
         cam = discovery.probe_device("/dev/video99")
     assert cam is None
+
+
+def test_probe_device_raises_on_busy():
+    """EBUSY means "already open" (normally by our own capture process),
+    not "not a camera" - the caller must be able to tell them apart."""
+    import errno
+
+    with mock.patch("os.open", side_effect=OSError(errno.EBUSY, "Device or resource busy")):
+        with pytest.raises(discovery.DeviceBusyError):
+            discovery.probe_device("/dev/video1")
+
+
+def test_discover_cameras_keeps_known_device_when_busy():
+    """A node we are already capturing from can refuse a second open().
+    It must not drop out of the registry, or rescan would tear down and
+    recreate every live camera."""
+    import errno
+
+    known = discovery.CameraDevice(
+        id="usb-Cam-A-video-index0",
+        device_node="/dev/video0",
+        name="Cam A",
+        source="usb",
+        driver="uvcvideo",
+        formats=[discovery.FrameFormat("MJPG", 640, 480, [30.0])],
+    )
+
+    with mock.patch("glob.glob", return_value=["/dev/video0"]), mock.patch(
+        "os.open", side_effect=OSError(errno.EBUSY, "Device or resource busy")
+    ):
+        cams = discovery.discover_cameras(known={"/dev/video0": known})
+        without_known = discovery.discover_cameras()
+
+    assert cams == [known]
+    assert without_known == []
 
 
 def test_discover_cameras_filters_and_orders(tmp_path):

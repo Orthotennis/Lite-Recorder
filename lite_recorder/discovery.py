@@ -9,6 +9,7 @@ This intentionally does not hardcode which nodes are cameras: every
 """
 from __future__ import annotations
 
+import errno
 import fcntl
 import glob
 import logging
@@ -17,6 +18,13 @@ import struct
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
+
+
+class DeviceBusyError(Exception):
+    """The node exists but cannot be opened because something already has
+    it open exclusively - normally our own ffmpeg capture process. This is
+    explicitly *not* "this is not a camera": treating it as such would drop
+    a live camera from the registry on every rescan."""
 
 # --- V4L2 ioctl / struct definitions (linux/videodev2.h) -----------------
 
@@ -221,6 +229,8 @@ def probe_device(device_node: str) -> CameraDevice | None:
     try:
         fd = os.open(device_node, os.O_RDWR | os.O_NONBLOCK)
     except OSError as exc:
+        if exc.errno == errno.EBUSY:
+            raise DeviceBusyError(device_node) from exc
         logger.debug("cannot open %s: %s", device_node, exc)
         return None
     try:
@@ -254,14 +264,29 @@ def probe_device(device_node: str) -> CameraDevice | None:
         os.close(fd)
 
 
-def discover_cameras() -> list[CameraDevice]:
+def discover_cameras(known: dict[str, CameraDevice] | None = None) -> list[CameraDevice]:
     """Enumerate every /dev/video* node and return the subset that are
-    genuine capture devices, sorted by device node for stable ordering."""
+    genuine capture devices, sorted by device node for stable ordering.
+
+    `known` maps device_node -> previously discovered CameraDevice. A node
+    we are already capturing from can refuse a second open() with EBUSY on
+    drivers that enforce exclusive access; without the fallback such a node
+    would look like "not a camera" and the live camera would be torn down
+    and recreated on every rescan."""
     nodes = sorted(glob.glob("/dev/video*"), key=lambda p: int("".join(filter(str.isdigit, p)) or 0))
+    known = known or {}
     cameras: list[CameraDevice] = []
     for node in nodes:
         try:
             cam = probe_device(node)
+        except DeviceBusyError:
+            previous = known.get(node)
+            if previous is None:
+                logger.warning("%s is busy and was never probed successfully; skipping", node)
+                continue
+            logger.debug("%s is busy (in use); keeping known device %s", node, previous.id)
+            cameras.append(previous)
+            continue
         except Exception:
             logger.exception("failed to probe %s, skipping", node)
             continue
