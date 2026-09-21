@@ -367,16 +367,36 @@ class CameraWorker:
 
     def _busy_hint(self) -> str:
         """Name whoever is holding the node, so "Device or resource busy"
-        points at a process instead of being a dead end."""
+        points at a process instead of being a dead end.
+
+        A holder of a *sibling* node counts: the other capture paths of one
+        physical camera share its hardware, so streaming through any one of
+        them is enough to make this one report EBUSY - while /proc shows
+        nothing at all holding this node. Reporting that as "the device is
+        wedged" is what makes this error look like a lifecycle bug in the
+        app when it is really two nodes of one camera.
+        """
         node = self.device.device_node
         try:
             mine = str(os.getpid())
             holders = [h for h in device_holders(node) if h.split()[0] != mine]
+            siblings = {
+                sibling: [h for h in device_holders(sibling) if h.split()[0] != mine]
+                for sibling in self.device.sibling_nodes
+            }
         except Exception:  # noqa: BLE001 - diagnostics must never mask the real error
             return ""
-        if not holders:
-            return f"\n(nothing else holds {node}; the device or its USB link is wedged)"
-        return f"\n({node} is held by: {', '.join(holders)})"
+        if holders:
+            return f"\n({node} is held by: {', '.join(holders)})"
+        busy_siblings = {s: h for s, h in siblings.items() if h}
+        if busy_siblings:
+            detail = "; ".join(f"{s} by {', '.join(h)}" for s, h in busy_siblings.items())
+            return (
+                f"\n(nothing holds {node} itself, but it is another capture path "
+                f"of the same physical camera as {detail} - one device cannot "
+                f"stream through two paths at once)"
+            )
+        return f"\n(nothing else holds {node}; the device or its USB link is wedged)"
 
     def _schedule_retry(self) -> None:
         delay = self._retry_delay

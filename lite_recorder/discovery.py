@@ -96,6 +96,12 @@ class CameraDevice:
     source: str  # "csi" | "usb" | "unknown"
     driver: str
     formats: list[FrameFormat] = field(default_factory=list)
+    # The physical device this node belongs to, and the *other* capture
+    # nodes of that same device. Only `device_node` is ever opened; the
+    # siblings are kept because they are the explanation for an EBUSY
+    # that no amount of retrying can clear.
+    physical_key: str = ""
+    sibling_nodes: list[str] = field(default_factory=list)
 
     def best_effort_default_format(self) -> FrameFormat | None:
         # Prefer MJPEG (saves USB bandwidth with many webcams), then
@@ -223,6 +229,67 @@ def _stable_id(device_node: str) -> str:
     return name
 
 
+# Pixel formats something can actually be previewed and recorded from.
+# A capture node advertising none of these is an auxiliary path of a
+# pipeline (e.g. the rkisp raw-capture nodes, which only emit Bayer), so
+# it is never the node to capture from when a real one shares its device.
+_USABLE_PIXEL_FORMATS = {
+    "MJPG", "JPEG", "YUYV", "YVYU", "UYVY", "VYUY", "NV12", "NV16", "NV21",
+    "NV24", "YU12", "YV12", "422P", "RGB3", "BGR3", "RGBP", "GREY", "H264", "HEVC",
+}
+
+
+def _sysfs_device_path(device_node: str) -> str | None:
+    """The sysfs device a /dev/videoN node hangs off.
+
+    For USB this is the UVC interface directory (e.g. .../1-1.3:1.0), so
+    two genuinely independent camera functions inside one composite device
+    keep separate identities. For a platform pipeline (rkisp/rkcif) it is
+    the pipeline's platform device, which every video node it exposes
+    shares.
+    """
+    link = os.path.join("/sys/class/video4linux", os.path.basename(device_node), "device")
+    try:
+        if not os.path.exists(link):
+            return None
+        return os.path.realpath(link)
+    except OSError:
+        return None
+
+
+def _physical_device_key(device_node: str, bus_info: str) -> str:
+    """Identify the physical device behind a node, so that several nodes
+    of one camera are never mistaken for several cameras."""
+    path = _sysfs_device_path(device_node)
+    if path:
+        return f"sysfs:{path}"
+    # No sysfs entry (unusual). A USB bus_info still identifies exactly one
+    # physical device, so grouping on it is safe. Anything else can be
+    # shared by independent sensors, so fall back to not grouping at all:
+    # a duplicate camera is a bug, but merging two real ones loses footage.
+    if bus_info.lower().startswith("usb-"):
+        return f"bus:{bus_info}"
+    return f"node:{device_node}"
+
+
+def _node_number(device_node: str) -> int:
+    digits = "".join(filter(str.isdigit, os.path.basename(device_node)))
+    return int(digits) if digits else 0
+
+
+def _capture_rank(device: CameraDevice, previously_used: bool) -> tuple:
+    """How suitable a node is as *the* node to capture its device from.
+    Sorted descending, so the best node comes first.
+
+    `previously_used` ranks first purely for stability: re-picking the node
+    we already capture from keeps the camera's identity (and therefore its
+    saved settings) fixed across rescans.
+    """
+    usable = any(f.pixel_format in _USABLE_PIXEL_FORMATS for f in device.formats)
+    max_area = max((f.width * f.height for f in device.formats), default=0)
+    return (previously_used, usable, max_area, -_node_number(device.device_node))
+
+
 def probe_device(device_node: str) -> CameraDevice | None:
     """Open a single /dev/videoN node and return a CameraDevice if it is
     a genuine capture device, else None (metadata nodes, subdevs, etc.)."""
@@ -259,6 +326,7 @@ def probe_device(device_node: str) -> CameraDevice | None:
             source=source,
             driver=cap["driver"],
             formats=formats,
+            physical_key=_physical_device_key(device_node, cap["bus_info"]),
         )
     finally:
         os.close(fd)
@@ -289,32 +357,201 @@ def device_holders(device_node: str) -> list[str]:
     return holders
 
 
+def _collapse_to_physical_devices(
+    probed: list[CameraDevice],
+    known: dict[str, CameraDevice],
+    skipped: set[str] | None = None,
+) -> list[CameraDevice]:
+    """Reduce the probed nodes to one per physical device.
+
+    One physical camera routinely exposes several capture-capable
+    /dev/videoN nodes: the alternate output paths of an ISP pipeline on
+    RK3588 (mainpath / selfpath / rawwrN), or a second streaming
+    interface on a webcam. They are paths into one piece of hardware, not
+    separate cameras - streaming through one is exactly what makes the
+    others return EBUSY, for as long as capture runs.
+
+    Registering a node per path therefore manufactures cameras that are
+    *permanently* "Device or resource busy", held by our own ffmpeg on a
+    sibling node, and no retry, re-ordering or teardown fix can ever clear
+    that: the device is legitimately in use. Only the best node of each
+    device becomes a camera; the rest are recorded as its siblings.
+    """
+    skipped = skipped or set()
+    groups: dict[str, list[CameraDevice]] = {}
+    for device in probed:
+        key = device.physical_key or f"node:{device.device_node}"
+        groups.setdefault(key, []).append(device)
+
+    cameras: list[CameraDevice] = []
+    for key, members in groups.items():
+        members.sort(key=lambda d: _capture_rank(d, d.device_node in known), reverse=True)
+        primary, *rest = members
+        # Nodes left unprobed on purpose (below) are absent from `members`,
+        # so they have to be carried over rather than dropped from the
+        # device they are already known to belong to.
+        siblings = {d.device_node for d in rest}
+        siblings |= {s for s in primary.sibling_nodes if s in skipped}
+        primary.sibling_nodes = sorted(siblings, key=_node_number)
+        if rest or primary.sibling_nodes:
+            logger.info(
+                "%s exposes %d capture nodes (%s) - these are alternate paths "
+                "of one device, so capturing from %s only; opening the others "
+                "could report nothing but 'Device or resource busy'",
+                primary.name or key,
+                1 + len(primary.sibling_nodes),
+                ", ".join([primary.device_node, *primary.sibling_nodes]),
+                primary.device_node,
+            )
+        cameras.append(primary)
+    cameras.sort(key=lambda d: _node_number(d.device_node))
+    return cameras
+
+
+def video_nodes() -> list[str]:
+    """Every /dev/video* node, in kernel numbering order."""
+    return sorted(
+        glob.glob("/dev/video*"),
+        key=lambda p: int("".join(filter(str.isdigit, p)) or 0),
+    )
+
+
+def _still_the_same_device(node: str, previous: CameraDevice) -> bool:
+    """Whether a busy node is still the device it was last probed as.
+
+    A busy node cannot be opened, so its identity has to be carried over
+    from the last successful probe - but /dev/videoN gets reassigned when
+    hardware comes and goes, and carrying a stale identity forward is how
+    a worker ends up pointed at another camera's node. sysfs answers this
+    without opening anything, so it works on a node we are streaming from.
+    """
+    path = _sysfs_device_path(node)
+    if path is None or not previous.physical_key.startswith("sysfs:"):
+        return True  # nothing to compare against - trust the last probe
+    return previous.physical_key == f"sysfs:{path}"
+
+
+def _probe_node(
+    node: str, known: dict[str, CameraDevice]
+) -> tuple[CameraDevice | None, bool]:
+    """Probe one node. Returns (device, busy), where `busy` means the node
+    exists but is already open - normally by our own capture process."""
+    try:
+        return probe_device(node), False
+    except DeviceBusyError:
+        previous = known.get(node)
+        if previous is None:
+            logger.warning("%s is busy and was never probed successfully; skipping", node)
+            return None, True
+        if not _still_the_same_device(node, previous):
+            # Dropping it here lets the worker be torn down and the node
+            # released, so the next pass can probe it for real.
+            logger.warning(
+                "%s is busy but sysfs says it is no longer the device %s was "
+                "probed on; discarding the stale identity",
+                node,
+                previous.id,
+            )
+            return None, True
+        logger.debug("%s is busy (in use); keeping known device %s", node, previous.id)
+        return previous, True
+    except Exception:
+        logger.exception("failed to probe %s, skipping", node)
+        return None, False
+
+
 def discover_cameras(known: dict[str, CameraDevice] | None = None) -> list[CameraDevice]:
-    """Enumerate every /dev/video* node and return the subset that are
-    genuine capture devices, sorted by device node for stable ordering.
+    """Enumerate every /dev/video* node and return one CameraDevice per
+    physical camera, sorted by device node for stable ordering.
 
     `known` maps device_node -> previously discovered CameraDevice. A node
     we are already capturing from can refuse a second open() with EBUSY on
     drivers that enforce exclusive access; without the fallback such a node
     would look like "not a camera" and the live camera would be torn down
-    and recreated on every rescan."""
-    nodes = sorted(glob.glob("/dev/video*"), key=lambda p: int("".join(filter(str.isdigit, p)) or 0))
+    and recreated on every rescan. It also keeps the choice of node stable
+    for a device that exposes more than one."""
+    nodes = video_nodes()
     known = known or {}
-    cameras: list[CameraDevice] = []
+    present = set(nodes)
+    probed: dict[str, CameraDevice] = {}
+    skipped: set[str] = set()
+
+    # Pass 1: the nodes we already capture from, so that the cameras that
+    # are live right now are identified before anything decides whether to
+    # open their remaining nodes.
     for node in nodes:
+        if node not in known:
+            continue
+        device, busy = _probe_node(node, known)
+        if device is None:
+            continue
+        probed[node] = device
+        if busy:
+            # This camera is streaming. Its other nodes are the same piece
+            # of hardware and we already know it, so opening them tells us
+            # nothing - while a stray open() on a streaming ISP pipeline is
+            # exactly the kind of poke that disturbs it. Leave them shut.
+            skipped |= {s for s in device.sibling_nodes if s in present}
+
+    # Pass 2: everything else, in node order.
+    for node in nodes:
+        if node in probed or node in skipped:
+            continue
+        device, _busy = _probe_node(node, known)
+        if device is not None:
+            probed[node] = device
+
+    ordered = [probed[node] for node in nodes if node in probed]
+    return _collapse_to_physical_devices(ordered, known, skipped)
+
+
+@dataclass
+class NodeReport:
+    """What one /dev/videoN node turned out to be, for diagnostics."""
+
+    node: str
+    status: str  # "capture" | "busy" | "other" | "error"
+    detail: str = ""
+    camera_id: str = ""  # the camera it was attributed to, if any
+
+
+def describe_nodes() -> tuple[list[CameraDevice], list[NodeReport]]:
+    """One probe pass over every /dev/video*, for diagnostics.
+
+    Unlike discover_cameras() this reports the nodes it could *not* use,
+    busy ones above all. A busy node is the normal case while the recorder
+    is running, and dropping it silently would hide the very camera
+    someone is trying to diagnose.
+
+    This opens every node, including the alternate paths of a device that
+    is streaming - which discover_cameras() deliberately avoids - so it is
+    best run with the recorder stopped.
+    """
+    probed: list[CameraDevice] = []
+    reports: list[NodeReport] = []
+    for node in video_nodes():
         try:
             cam = probe_device(node)
         except DeviceBusyError:
-            previous = known.get(node)
-            if previous is None:
-                logger.warning("%s is busy and was never probed successfully; skipping", node)
-                continue
-            logger.debug("%s is busy (in use); keeping known device %s", node, previous.id)
-            cameras.append(previous)
+            holders = device_holders(node)
+            reports.append(
+                NodeReport(node, "busy", ", ".join(holders) if holders else "holder unknown")
+            )
             continue
-        except Exception:
-            logger.exception("failed to probe %s, skipping", node)
+        except Exception as exc:  # noqa: BLE001 - a diagnostic reports, never raises
+            reports.append(NodeReport(node, "error", str(exc)))
             continue
-        if cam is not None:
-            cameras.append(cam)
-    return cameras
+        if cam is None:
+            reports.append(NodeReport(node, "other", "not a capture node (metadata/subdev)"))
+        else:
+            probed.append(cam)
+            reports.append(NodeReport(node, "capture"))
+
+    cameras = _collapse_to_physical_devices(probed, {})
+    owner = {}
+    for cam in cameras:
+        for node in [cam.device_node, *cam.sibling_nodes]:
+            owner[node] = cam.id
+    for report in reports:
+        report.camera_id = owner.get(report.node, "")
+    return cameras, reports
