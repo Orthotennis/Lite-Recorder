@@ -1,4 +1,6 @@
+import subprocess
 import time
+from unittest import mock
 
 import pytest
 
@@ -219,3 +221,91 @@ def test_session_dedupes_duplicate_labels(manager):
     names = sorted(p.name for p in d.glob("*.mp4"))
     assert "cam.mp4" in names
     assert "cam-2.mp4" in names
+
+
+def test_default_fps_is_not_the_cameras_maximum():
+    """Frame intervals are advertised shortest-first, so taking the first
+    one paired every camera with its largest frame size - e.g.
+    1920x1200@120fps, about a whole USB 2.0 bus for a single stream."""
+    fmt = manager_mod.discovery.FrameFormat("MJPG", 1920, 1200, [120.0, 60.0, 30.0])
+    assert manager_mod._default_fps(fmt) == 30
+    # Nothing within the cap: fall back to the gentlest rate on offer.
+    assert manager_mod._default_fps(
+        manager_mod.discovery.FrameFormat("MJPG", 1920, 1200, [120.0, 60.0])
+    ) == 60
+    assert manager_mod._default_fps(None) == 30
+
+
+class _WedgedProc:
+    """ffmpeg stuck in an uninterruptible USB ioctl: ignores everything."""
+
+    pid = 4242
+
+    def __init__(self, *_a, **_kw):
+        self.returncode = None
+        self.stdin = self.stdout = self.stderr = None
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        raise subprocess.TimeoutExpired("ffmpeg", timeout or 0)
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+
+def _real_manager(tmp_path, monkeypatch, devices):
+    """A manager over `devices` with ffmpeg and the encoder probe stubbed."""
+    monkeypatch.setattr(manager_mod, "select_encoder",
+                        lambda *a, **k: manager_mod.EncoderInfo("libx264", "software", False))
+    monkeypatch.setattr(manager_mod.discovery, "discover_cameras", lambda known=None: list(devices[0]))
+    settings = Settings(recordings_root=tmp_path / "rec", state_dir=tmp_path / "state")
+    settings.ensure_dirs()
+    return CameraManager(settings)
+
+
+def _dev(cam_id, node):
+    return manager_mod.discovery.CameraDevice(
+        id=cam_id, device_node=node, name="USB Camera", source="usb", driver="uvcvideo",
+        formats=[manager_mod.discovery.FrameFormat("MJPG", 1920, 1200, [120.0, 30.0])])
+
+
+def test_one_wedged_camera_does_not_corrupt_the_registry(tmp_path, monkeypatch):
+    """The bug behind the recurring "Device or resource busy": tearing
+    down an unkillable ffmpeg raised TimeoutExpired out of rescan(),
+    which aborted the pass part-way - leaving a worker for a camera that
+    was gone, two workers bound to one /dev/videoN, and the other
+    camera's node released but never reopened."""
+    # Two identical cameras: udev can only give the shared by-id symlink
+    # name to one of them, so the other falls back to a by-path id - and
+    # the id moves between them whenever udev re-arbitrates the link.
+    id_usb = "usb-WN-251029-XH_USB_Camera_01.00.00-video-index0"
+    path_11 = "platform-fc800000.usb-usb-0:1.1:1.0-video-index0"
+    path_12 = "platform-fc800000.usb-usb-0:1.2:1.0-video-index0"
+    devices = [[_dev(id_usb, "/dev/video0"), _dev(path_12, "/dev/video1")]]
+
+    with mock.patch("subprocess.Popen", _WedgedProc):
+        mgr = _real_manager(tmp_path, monkeypatch, devices)
+        # udev hands the by-id link to the other camera; the user rescans.
+        devices[0] = [_dev(path_11, "/dev/video0"), _dev(id_usb, "/dev/video1")]
+        mgr.rescan()                       # must not raise
+
+        nodes = [w.device.device_node for w in mgr._workers.values()]
+        assert sorted(nodes) == ["/dev/video0", "/dev/video1"], nodes
+        assert len(nodes) == len(set(nodes)), "two workers bound to one node"
+        assert set(mgr._workers) == {id_usb, path_11}
+        mgr.shutdown()                     # must not raise either
+
+
+def test_two_ids_never_share_one_device_node(tmp_path, monkeypatch):
+    """A node can only be captured once; a duplicate would be guaranteed
+    to lose with "Device or resource busy"."""
+    devices = [[_dev("cam-a", "/dev/video0"), _dev("cam-b", "/dev/video0")]]
+    with mock.patch("subprocess.Popen", _WedgedProc):
+        mgr = _real_manager(tmp_path, monkeypatch, devices)
+        assert len(mgr._workers) == 1
+        mgr.shutdown()

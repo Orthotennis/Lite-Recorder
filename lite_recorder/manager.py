@@ -25,6 +25,24 @@ _SLUG_RE = re.compile(r"[^a-zA-Z0-9_-]+")
 _CAPTURE_FIELDS = {"width", "height", "fps", "pixel_format"}
 
 
+# Cameras advertise frame intervals shortest-first, so "the first rate
+# listed" is the *fastest* one - and combined with the largest advertised
+# frame size that made every camera default to e.g. 1920x1200@120fps. A
+# single such MJPEG stream is already around the whole isochronous budget
+# of a USB 2.0 bus, so the second camera sharing that bus could not start
+# and its ffmpeg would wedge mid-ioctl. Default to something several
+# cameras can actually sustain; the UI can still raise it per camera.
+_DEFAULT_MAX_FPS = 30
+
+
+def _default_fps(fmt: discovery.FrameFormat | None) -> int:
+    """Fastest advertised rate that stays within the default cap."""
+    if fmt is None or not fmt.framerates:
+        return _DEFAULT_MAX_FPS
+    within_cap = [r for r in fmt.framerates if r <= _DEFAULT_MAX_FPS]
+    return int(max(within_cap) if within_cap else min(fmt.framerates))
+
+
 def slugify(label: str) -> str:
     slug = _SLUG_RE.sub("-", label.strip()).strip("-")
     return slug or "camera"
@@ -90,7 +108,7 @@ class CameraManager:
             label=stored.get("label", device.id),
             width=stored.get("width", default_fmt.width if default_fmt else 1280),
             height=stored.get("height", default_fmt.height if default_fmt else 720),
-            fps=stored.get("fps", int(default_fmt.framerates[0]) if default_fmt and default_fmt.framerates else 30),
+            fps=stored.get("fps", _default_fps(default_fmt)),
             pixel_format=stored.get("pixel_format", default_fmt.pixel_format if default_fmt else "MJPG"),
             bitrate_kbps=stored.get("bitrate_kbps", 4000),
             enabled=stored.get("enabled", True),
@@ -105,8 +123,22 @@ class CameraManager:
                     known={d.device_node: d for d in self._devices.values()}
                 )
             seen_ids = set()
+            seen_nodes: dict[str, str] = {}
+            stuck_nodes: set[str] = set()
             to_start: list[CameraWorker] = []
             for device in devices:
+                # Two ids must never resolve to one /dev/videoN: the second
+                # worker could only ever fail with EBUSY against the first.
+                owner = seen_nodes.get(device.device_node)
+                if owner is not None:
+                    logger.warning(
+                        "ignoring camera %s: %s is already claimed by %s",
+                        device.id,
+                        device.device_node,
+                        owner,
+                    )
+                    continue
+                seen_nodes[device.device_node] = device.id
                 seen_ids.add(device.id)
                 cam_settings = self._settings_for(device)
                 self._devices[device.id] = device
@@ -146,14 +178,25 @@ class CameraManager:
                     to_start.append(worker)
 
             # Drop workers for cameras that disappeared (e.g. unplugged).
+            # A worker that cannot be stopped still has to leave the
+            # registry: keeping it would leave two workers bound to one
+            # /dev/videoN. The node it pins is remembered below instead.
             for gone_id in set(self._workers) - seen_ids:
-                self._workers[gone_id].stop()
-                del self._workers[gone_id]
-                del self._devices[gone_id]
+                worker = self._workers.pop(gone_id)
+                self._devices.pop(gone_id, None)
+                worker.stop()
+                stuck_nodes |= worker.stuck_nodes()
 
             # Every reassigned node has been released by now, so these can
-            # open their new nodes without racing each other.
+            # open their new nodes without racing each other - except any
+            # node still pinned by an ffmpeg that refused to die, where a
+            # fresh capture could only fail with "Device or resource busy".
+            for worker in self._workers.values():
+                stuck_nodes |= worker.stuck_nodes()
             for worker in to_start:
+                if worker.device.device_node in stuck_nodes:
+                    worker.mark_blocked()
+                    continue
                 worker.start_preview()
 
     def list_cameras(self) -> list[CameraStatus]:
@@ -271,5 +314,10 @@ class CameraManager:
 
     def shutdown(self) -> None:
         with self._lock:
+            # One uncooperative camera must not abort the shutdown and
+            # leak every remaining ffmpeg onto its device node.
             for worker in self._workers.values():
-                worker.stop()
+                try:
+                    worker.stop()
+                except Exception:  # noqa: BLE001 - keep tearing the rest down
+                    logger.exception("camera %s failed to stop cleanly", worker.device.id)
