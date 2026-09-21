@@ -10,6 +10,42 @@ import uvicorn
 from .config import Settings
 
 
+def _list_devices() -> None:
+    """Show what the hardware actually exposes.
+
+    One physical camera can present several capture-capable /dev/videoN
+    nodes, and only one of them can stream at a time - so a node listed
+    under "also exposes" is *expected* to report "Device or resource busy"
+    and is deliberately not opened. Run this on the box to confirm the
+    camera count matches the cameras physically attached.
+    """
+    from . import discovery
+
+    cameras = discovery.discover_cameras()
+    if not cameras:
+        print("No capture devices found under /dev/video*")
+        return
+    print(f"{len(cameras)} camera(s):\n")
+    for cam in cameras:
+        print(f"  {cam.id}")
+        print(f"    name        {cam.name}  ({cam.source}, {cam.driver})")
+        print(f"    capture on  {cam.device_node}")
+        if cam.sibling_nodes:
+            print(
+                "    also exposes "
+                + ", ".join(cam.sibling_nodes)
+                + "  (same device - not opened)"
+            )
+        best = cam.best_effort_default_format()
+        if best:
+            print(f"    default     {best.pixel_format} {best.width}x{best.height}")
+        for node in [cam.device_node, *cam.sibling_nodes]:
+            holders = discovery.device_holders(node)
+            if holders:
+                print(f"    in use      {node} held by {', '.join(holders)}")
+        print()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="lite_recorder")
     parser.add_argument("--host", default=None, help="Bind host (default: env or 0.0.0.0)")
@@ -23,6 +59,12 @@ def main() -> None:
         "--recordings-root", default=None, help="Override recordings storage root"
     )
     parser.add_argument("--log-level", default="info")
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="Print the cameras discovery finds, and the /dev/video* nodes "
+        "it decided belong to each one, then exit",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=args.log_level.upper())
@@ -37,6 +79,10 @@ def main() -> None:
         settings.host = args.host
     if args.port:
         settings.port = args.port
+
+    if args.list_devices:
+        _list_devices()
+        return
 
     from .app import create_app
 

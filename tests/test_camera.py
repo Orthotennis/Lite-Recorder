@@ -216,3 +216,61 @@ def test_worker_recovers_once_the_wedged_process_finally_exits(worker):
     with mock.patch("subprocess.Popen", FakeProc):
         worker.start_preview()
     assert worker.state == "preview"
+
+
+# --- EBUSY caused by another node of the SAME physical camera ------------
+
+
+def _worker_with_siblings(siblings):
+    device = CameraDevice(
+        id="rkisp_mainpath",
+        device_node="/dev/video0",
+        name="rkisp_mainpath",
+        source="csi",
+        driver="rkisp",
+        formats=[FrameFormat("NV12", 1920, 1080, [30.0])],
+        physical_key="sysfs:/sys/devices/platform/rkisp-vir0",
+        sibling_nodes=siblings,
+    )
+    return CameraWorker(
+        device=device,
+        settings=CameraSettings(label="cam-a"),
+        ffmpeg_bin="ffmpeg",
+        preview_width=640,
+        preview_fps=10,
+    )
+
+
+def test_busy_hint_names_a_sibling_node_holding_the_same_device():
+    """/proc shows nothing holding *this* node, because the conflict is on
+    another capture path of the same camera. Reporting that as "the device
+    is wedged" is what makes this look like an app lifecycle bug."""
+    worker = _worker_with_siblings(["/dev/video1"])
+    holders = {"/dev/video0": [], "/dev/video1": ["991 (ffmpeg)"]}
+
+    with mock.patch("lite_recorder.camera.device_holders", side_effect=lambda n: holders[n]):
+        hint = worker._busy_hint()
+
+    assert "/dev/video1" in hint
+    assert "991 (ffmpeg)" in hint
+    assert "same physical camera" in hint
+    assert "wedged" not in hint
+
+
+def test_busy_hint_still_reports_a_direct_holder_first():
+    worker = _worker_with_siblings(["/dev/video1"])
+    holders = {"/dev/video0": ["42 (ffmpeg)"], "/dev/video1": ["991 (ffmpeg)"]}
+
+    with mock.patch("lite_recorder.camera.device_holders", side_effect=lambda n: holders[n]):
+        hint = worker._busy_hint()
+
+    assert "/dev/video0 is held by: 42 (ffmpeg)" in hint
+
+
+def test_busy_hint_falls_back_when_nothing_holds_any_node():
+    worker = _worker_with_siblings(["/dev/video1"])
+
+    with mock.patch("lite_recorder.camera.device_holders", return_value=[]):
+        hint = worker._busy_hint()
+
+    assert "wedged" in hint

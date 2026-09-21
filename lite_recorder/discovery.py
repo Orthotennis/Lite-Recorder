@@ -96,6 +96,12 @@ class CameraDevice:
     source: str  # "csi" | "usb" | "unknown"
     driver: str
     formats: list[FrameFormat] = field(default_factory=list)
+    # The physical device this node belongs to, and the *other* capture
+    # nodes of that same device. Only `device_node` is ever opened; the
+    # siblings are kept because they are the explanation for an EBUSY
+    # that no amount of retrying can clear.
+    physical_key: str = ""
+    sibling_nodes: list[str] = field(default_factory=list)
 
     def best_effort_default_format(self) -> FrameFormat | None:
         # Prefer MJPEG (saves USB bandwidth with many webcams), then
@@ -223,6 +229,67 @@ def _stable_id(device_node: str) -> str:
     return name
 
 
+# Pixel formats something can actually be previewed and recorded from.
+# A capture node advertising none of these is an auxiliary path of a
+# pipeline (e.g. the rkisp raw-capture nodes, which only emit Bayer), so
+# it is never the node to capture from when a real one shares its device.
+_USABLE_PIXEL_FORMATS = {
+    "MJPG", "JPEG", "YUYV", "YVYU", "UYVY", "VYUY", "NV12", "NV16", "NV21",
+    "NV24", "YU12", "YV12", "422P", "RGB3", "BGR3", "RGBP", "GREY", "H264", "HEVC",
+}
+
+
+def _sysfs_device_path(device_node: str) -> str | None:
+    """The sysfs device a /dev/videoN node hangs off.
+
+    For USB this is the UVC interface directory (e.g. .../1-1.3:1.0), so
+    two genuinely independent camera functions inside one composite device
+    keep separate identities. For a platform pipeline (rkisp/rkcif) it is
+    the pipeline's platform device, which every video node it exposes
+    shares.
+    """
+    link = os.path.join("/sys/class/video4linux", os.path.basename(device_node), "device")
+    try:
+        if not os.path.exists(link):
+            return None
+        return os.path.realpath(link)
+    except OSError:
+        return None
+
+
+def _physical_device_key(device_node: str, bus_info: str) -> str:
+    """Identify the physical device behind a node, so that several nodes
+    of one camera are never mistaken for several cameras."""
+    path = _sysfs_device_path(device_node)
+    if path:
+        return f"sysfs:{path}"
+    # No sysfs entry (unusual). A USB bus_info still identifies exactly one
+    # physical device, so grouping on it is safe. Anything else can be
+    # shared by independent sensors, so fall back to not grouping at all:
+    # a duplicate camera is a bug, but merging two real ones loses footage.
+    if bus_info.lower().startswith("usb-"):
+        return f"bus:{bus_info}"
+    return f"node:{device_node}"
+
+
+def _node_number(device_node: str) -> int:
+    digits = "".join(filter(str.isdigit, os.path.basename(device_node)))
+    return int(digits) if digits else 0
+
+
+def _capture_rank(device: CameraDevice, previously_used: bool) -> tuple:
+    """How suitable a node is as *the* node to capture its device from.
+    Sorted descending, so the best node comes first.
+
+    `previously_used` ranks first purely for stability: re-picking the node
+    we already capture from keeps the camera's identity (and therefore its
+    saved settings) fixed across rescans.
+    """
+    usable = any(f.pixel_format in _USABLE_PIXEL_FORMATS for f in device.formats)
+    max_area = max((f.width * f.height for f in device.formats), default=0)
+    return (previously_used, usable, max_area, -_node_number(device.device_node))
+
+
 def probe_device(device_node: str) -> CameraDevice | None:
     """Open a single /dev/videoN node and return a CameraDevice if it is
     a genuine capture device, else None (metadata nodes, subdevs, etc.)."""
@@ -259,6 +326,7 @@ def probe_device(device_node: str) -> CameraDevice | None:
             source=source,
             driver=cap["driver"],
             formats=formats,
+            physical_key=_physical_device_key(device_node, cap["bus_info"]),
         )
     finally:
         os.close(fd)
@@ -289,18 +357,62 @@ def device_holders(device_node: str) -> list[str]:
     return holders
 
 
+def _collapse_to_physical_devices(
+    probed: list[CameraDevice], known: dict[str, CameraDevice]
+) -> list[CameraDevice]:
+    """Reduce the probed nodes to one per physical device.
+
+    One physical camera routinely exposes several capture-capable
+    /dev/videoN nodes: the alternate output paths of an ISP pipeline on
+    RK3588 (mainpath / selfpath / rawwrN), or a second streaming
+    interface on a webcam. They are paths into one piece of hardware, not
+    separate cameras - streaming through one is exactly what makes the
+    others return EBUSY, for as long as capture runs.
+
+    Registering a node per path therefore manufactures cameras that are
+    *permanently* "Device or resource busy", held by our own ffmpeg on a
+    sibling node, and no retry, re-ordering or teardown fix can ever clear
+    that: the device is legitimately in use. Only the best node of each
+    device becomes a camera; the rest are recorded as its siblings.
+    """
+    groups: dict[str, list[CameraDevice]] = {}
+    for device in probed:
+        key = device.physical_key or f"node:{device.device_node}"
+        groups.setdefault(key, []).append(device)
+
+    cameras: list[CameraDevice] = []
+    for key, members in groups.items():
+        members.sort(key=lambda d: _capture_rank(d, d.device_node in known), reverse=True)
+        primary, *rest = members
+        primary.sibling_nodes = [d.device_node for d in rest]
+        if rest:
+            logger.info(
+                "%s exposes %d capture nodes (%s) - these are alternate paths "
+                "of one device, so capturing from %s only; opening the others "
+                "could report nothing but 'Device or resource busy'",
+                primary.name or key,
+                len(members),
+                ", ".join(d.device_node for d in members),
+                primary.device_node,
+            )
+        cameras.append(primary)
+    cameras.sort(key=lambda d: _node_number(d.device_node))
+    return cameras
+
+
 def discover_cameras(known: dict[str, CameraDevice] | None = None) -> list[CameraDevice]:
-    """Enumerate every /dev/video* node and return the subset that are
-    genuine capture devices, sorted by device node for stable ordering.
+    """Enumerate every /dev/video* node and return one CameraDevice per
+    physical camera, sorted by device node for stable ordering.
 
     `known` maps device_node -> previously discovered CameraDevice. A node
     we are already capturing from can refuse a second open() with EBUSY on
     drivers that enforce exclusive access; without the fallback such a node
     would look like "not a camera" and the live camera would be torn down
-    and recreated on every rescan."""
+    and recreated on every rescan. It also keeps the choice of node stable
+    for a device that exposes more than one."""
     nodes = sorted(glob.glob("/dev/video*"), key=lambda p: int("".join(filter(str.isdigit, p)) or 0))
     known = known or {}
-    cameras: list[CameraDevice] = []
+    probed: list[CameraDevice] = []
     for node in nodes:
         try:
             cam = probe_device(node)
@@ -310,11 +422,11 @@ def discover_cameras(known: dict[str, CameraDevice] | None = None) -> list[Camer
                 logger.warning("%s is busy and was never probed successfully; skipping", node)
                 continue
             logger.debug("%s is busy (in use); keeping known device %s", node, previous.id)
-            cameras.append(previous)
+            probed.append(previous)
             continue
         except Exception:
             logger.exception("failed to probe %s, skipping", node)
             continue
         if cam is not None:
-            cameras.append(cam)
-    return cameras
+            probed.append(cam)
+    return _collapse_to_physical_devices(probed, known)

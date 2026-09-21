@@ -179,3 +179,171 @@ def test_discover_cameras_filters_and_orders(tmp_path):
         cams = discovery.discover_cameras()
 
     assert [c.device_node for c in cams] == ["/dev/video0"]
+
+
+# --- one camera, several capture nodes -----------------------------------
+#
+# A single physical camera routinely exposes more than one capture-capable
+# /dev/videoN: the alternate output paths of an RK3588 ISP pipeline
+# (mainpath / selfpath / rawwrN), or a second streaming interface on a
+# webcam. Registering one camera per node means the second worker opens a
+# node whose hardware the first is already streaming, which fails with
+# "Device or resource busy" permanently - correctly, and for as long as
+# capture runs. No retry or re-ordering can fix that; discovery must not
+# create the duplicate in the first place.
+
+
+def _fake_v4l2_tree(nodes: dict, sysfs: dict):
+    """Patch glob/open/ioctl/sysfs for a set of {node: FakeV4L2Node}."""
+    fds = {node: i + 1 for i, node in enumerate(sorted(nodes))}
+    by_fd = {fd: nodes[node] for node, fd in fds.items()}
+
+    def fake_open(path, *_args, **_kwargs):
+        return fds[path]
+
+    def fake_ioctl(fd, request, buf):
+        result = by_fd[fd].ioctl(request, bytes(buf))
+        buf[: len(result)] = result
+        return 0
+
+    def fake_exists(path):
+        return path.rsplit("/", 2)[-2] in {n.rsplit("/", 1)[-1] for n in sysfs}
+
+    def fake_realpath(path):
+        video = path.rsplit("/", 2)[-2]
+        return sysfs[f"/dev/{video}"]
+
+    return (
+        mock.patch("glob.glob", return_value=sorted(nodes)),
+        mock.patch("os.open", side_effect=fake_open),
+        mock.patch("os.close"),
+        mock.patch("fcntl.ioctl", side_effect=fake_ioctl),
+        mock.patch("os.path.exists", side_effect=fake_exists),
+        mock.patch("os.path.realpath", side_effect=fake_realpath),
+    )
+
+
+def _discover(nodes, sysfs, known=None):
+    patches = _fake_v4l2_tree(nodes, sysfs)
+    for p in patches:
+        p.start()
+    try:
+        return discovery.discover_cameras(known=known)
+    finally:
+        for p in patches:
+            p.stop()
+
+
+def test_isp_pipeline_paths_become_one_camera():
+    """rkisp exposes mainpath/selfpath/rawwr for ONE sensor. Three cameras
+    here means two of them are permanently EBUSY against the third."""
+    nodes = {
+        "/dev/video0": FakeV4L2Node(
+            "rkisp", "rkisp_mainpath", "platform:rkisp-vir0",
+            [("NV12", [(1920, 1080, [30])])],
+        ),
+        "/dev/video1": FakeV4L2Node(
+            "rkisp", "rkisp_selfpath", "platform:rkisp-vir0",
+            [("NV12", [(1280, 720, [30])])],
+        ),
+        "/dev/video2": FakeV4L2Node(
+            "rkisp", "rkisp_rawwr0", "platform:rkisp-vir0",
+            [("BG10", [(1920, 1080, [30])])],
+        ),
+    }
+    sysfs = dict.fromkeys(nodes, "/sys/devices/platform/rkisp-vir0")
+
+    cams = _discover(nodes, sysfs)
+
+    assert [c.device_node for c in cams] == ["/dev/video0"]
+    # The highest-resolution path that emits a usable pixel format wins;
+    # the raw Bayer node is never a capture candidate.
+    assert cams[0].sibling_nodes == ["/dev/video1", "/dev/video2"]
+
+
+def test_two_isp_pipelines_stay_two_cameras():
+    """Grouping must not merge genuinely separate sensors: losing a real
+    camera is worse than the duplicate this is fixing."""
+    nodes = {
+        "/dev/video0": FakeV4L2Node(
+            "rkisp", "rkisp_mainpath", "platform:rkisp-vir0", [("NV12", [(1920, 1080, [30])])]
+        ),
+        "/dev/video1": FakeV4L2Node(
+            "rkisp", "rkisp_selfpath", "platform:rkisp-vir0", [("NV12", [(1280, 720, [30])])]
+        ),
+        "/dev/video2": FakeV4L2Node(
+            "rkisp", "rkisp_mainpath", "platform:rkisp-vir1", [("NV12", [(1920, 1080, [30])])]
+        ),
+        "/dev/video3": FakeV4L2Node(
+            "rkisp", "rkisp_selfpath", "platform:rkisp-vir1", [("NV12", [(1280, 720, [30])])]
+        ),
+    }
+    sysfs = {
+        "/dev/video0": "/sys/devices/platform/rkisp-vir0",
+        "/dev/video1": "/sys/devices/platform/rkisp-vir0",
+        "/dev/video2": "/sys/devices/platform/rkisp-vir1",
+        "/dev/video3": "/sys/devices/platform/rkisp-vir1",
+    }
+
+    cams = _discover(nodes, sysfs)
+
+    assert [c.device_node for c in cams] == ["/dev/video0", "/dev/video2"]
+
+
+def test_usb_cameras_on_separate_interfaces_stay_separate():
+    """Two webcams are two cameras even though both are 'usb'."""
+    nodes = {
+        "/dev/video0": FakeV4L2Node(
+            "uvcvideo", "Cam A", "usb-xhci-hcd.0.auto-1.1", [("MJPG", [(1280, 720, [30])])]
+        ),
+        "/dev/video2": FakeV4L2Node(
+            "uvcvideo", "Cam B", "usb-xhci-hcd.0.auto-1.2", [("MJPG", [(1280, 720, [30])])]
+        ),
+    }
+    sysfs = {
+        "/dev/video0": "/sys/devices/platform/usb1/1-1/1-1.1/1-1.1:1.0",
+        "/dev/video2": "/sys/devices/platform/usb1/1-1/1-1.2/1-1.2:1.0",
+    }
+
+    cams = _discover(nodes, sysfs)
+
+    assert [c.device_node for c in cams] == ["/dev/video0", "/dev/video2"]
+    assert all(c.sibling_nodes == [] for c in cams)
+
+
+def test_node_already_in_use_stays_the_chosen_one():
+    """The chosen node decides the camera's id, and therefore which saved
+    settings it gets. It must not drift between rescans."""
+    nodes = {
+        "/dev/video0": FakeV4L2Node(
+            "rkisp", "rkisp_mainpath", "platform:rkisp-vir0", [("NV12", [(1920, 1080, [30])])]
+        ),
+        "/dev/video1": FakeV4L2Node(
+            "rkisp", "rkisp_selfpath", "platform:rkisp-vir0", [("NV12", [(1280, 720, [30])])]
+        ),
+    }
+    sysfs = dict.fromkeys(nodes, "/sys/devices/platform/rkisp-vir0")
+
+    already_capturing = discovery.CameraDevice(
+        id="selfpath", device_node="/dev/video1", name="rkisp_selfpath",
+        source="csi", driver="rkisp",
+        formats=[discovery.FrameFormat("NV12", 1280, 720, [30.0])],
+        physical_key="sysfs:/sys/devices/platform/rkisp-vir0",
+    )
+
+    cams = _discover(nodes, sysfs, known={"/dev/video1": already_capturing})
+
+    assert [c.device_node for c in cams] == ["/dev/video1"]
+
+
+def test_physical_key_does_not_merge_platform_devices_without_sysfs():
+    """Without sysfs, only USB bus_info identifies one physical device.
+    A shared platform bus_info must not collapse distinct sensors."""
+    with mock.patch("os.path.exists", return_value=False):
+        a = discovery._physical_device_key("/dev/video0", "platform:rkcif")
+        b = discovery._physical_device_key("/dev/video1", "platform:rkcif")
+        usb_a = discovery._physical_device_key("/dev/video2", "usb-xhci-hcd.0.auto-1.1")
+        usb_b = discovery._physical_device_key("/dev/video3", "usb-xhci-hcd.0.auto-1.1")
+
+    assert a != b
+    assert usb_a == usb_b

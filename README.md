@@ -31,7 +31,10 @@ Wi-Fi AP (`hostapd` + `dnsmasq`) → static IP `192.168.4.1` → FastAPI
 web app. `ffmpeg` does all capture/encoding; each camera has exactly
 one ffmpeg process (a V4L2 device can only be opened once) that tees
 its output to both a downscaled MJPEG preview and, while recording,
-the MP4 file — so live preview keeps working during a take.
+the MP4 file — so live preview keeps working during a take. Discovery
+resolves `/dev/video*` nodes down to one per *physical* device, since a
+single camera commonly exposes several capture nodes that cannot stream
+at the same time.
 
 ## Quick start (run locally, no install needed)
 
@@ -195,25 +198,44 @@ that it now shows `unmanaged`.
 ### A camera shows "Device or resource busy"
 
 Each camera is opened by exactly one ffmpeg process, so this means
-something else already holds that `/dev/videoN`. The app handles the
-cases it can cause itself — a camera's node being renumbered when
-another camera is plugged in, a rescan racing an automatic retry, and a
-node that refuses a second `open()` while it is being captured — and
-retries a failed preview with backoff, so a transient conflict clears on
-its own.
+something else already holds the hardware behind that `/dev/videoN`.
 
-If it persists, the holder is outside the app. Check with:
+**The usual cause is the device itself, not contention.** A single
+physical camera often exposes *several* capture-capable `/dev/video*`
+nodes — on RK3588 an ISP pipeline publishes `mainpath`, `selfpath` and
+`rawwrN` for one sensor, and some webcams publish a second streaming
+interface. Those are alternate paths into one piece of hardware: while
+one is streaming, opening another fails with "Device or resource busy"
+permanently and by design. Registering a camera per node therefore
+produces a camera that can never start, and no amount of retrying will
+clear it — which looks exactly like a bug in the app.
+
+Discovery groups nodes by their physical device and captures from one
+node per device. To see what your board actually exposes, and which
+nodes were grouped together:
+
+```
+/opt/lite-recorder/venv/bin/python -m lite_recorder --list-devices
+```
+
+A node listed under "also exposes" is a second path into a camera
+that is already listed — not a missing camera. If the camera count
+matches what is physically attached, the grouping is right.
+
+If a camera that *should* work is busy, the holder is outside the app.
+Check with:
 
 ```
 sudo fuser -v /dev/video*
 ```
 
 If that names a process (another capture tool, a leftover `ffmpeg` from
-a killed run), stop it. If nothing holds the node, suspect USB
-bandwidth rather than contention: several cameras on one controller at
-high resolution/framerate can fail to start. Confirm by lowering the
-resolution or framerate for the affected cameras in the UI, and prefer
-spreading cameras across separate USB controllers over a single hub.
+a killed run), stop it. If nothing holds the node or any of its
+siblings, suspect USB bandwidth rather than contention: several cameras
+on one controller at high resolution/framerate can fail to start.
+Confirm by lowering the resolution or framerate for the affected
+cameras in the UI, and prefer spreading cameras across separate USB
+controllers over a single hub.
 
 ### Enabling the CSI cameras
 
