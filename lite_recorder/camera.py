@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -18,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import encoder as encoder_mod
-from .discovery import CameraDevice, FrameFormat
+from .discovery import CameraDevice, FrameFormat, device_holders
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,11 @@ STATE_IDLE = "idle"
 STATE_PREVIEW = "preview"
 STATE_RECORDING = "recording"
 STATE_ERROR = "error"
+
+_STUCK_MSG = (
+    "ffmpeg could not be stopped and still holds {node}; the camera is "
+    "wedged (replug it, or reset its USB port). Retrying until it frees up."
+)
 
 
 @dataclass
@@ -100,6 +106,9 @@ class CameraWorker:
         self._last_frame_at = 0.0
         self._stopping = False
 
+        # ffmpeg processes that survived SIGKILL, with the node each
+        # still pins, so nothing is started on that node meanwhile.
+        self._unkillable: list[tuple[subprocess.Popen, str]] = []
         self._retry_timer: threading.Timer | None = None
         self._retry_delay = 2.0
         self._retry_delay_max = 30.0
@@ -145,23 +154,40 @@ class CameraWorker:
         """Drop back to preview-only (keeps the camera live)."""
         self._spawn(record_path=None)
 
-    def release(self) -> None:
+    def release(self) -> bool:
         """Terminate the ffmpeg process and free the device node, leaving
         the worker reusable (used when a camera's /dev/videoN is being
-        reassigned and must be released before anything re-opens it)."""
+        reassigned and must be released before anything re-opens it).
+
+        Returns True when the node is confirmed free. Never raises - a
+        caller walking every worker must not be derailed by one of them.
+        """
         with self._spawn_lock:
             self._stopping = True
             self._cancel_retry()
-            self._terminate_process()
+            released = self._terminate_process()
             with self._lock:
-                self._state = STATE_IDLE
                 self._recording_path = None
+                if released:
+                    self._state = STATE_IDLE
+                    self._error = ""
+                else:
+                    self._state = STATE_ERROR
+                    self._error = _STUCK_MSG.format(node=self.device.device_node)
+            return released
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         """Permanently stop this camera's ffmpeg process."""
         with self._spawn_lock:
             self._closed = True
-            self.release()
+            return self.release()
+
+    def mark_blocked(self) -> None:
+        """Report that this camera's node is pinned by an ffmpeg that
+        would not die, so capture was deliberately not started."""
+        with self._lock:
+            self._state = STATE_ERROR
+            self._error = _STUCK_MSG.format(node=self.device.device_node)
 
     # -- internals ------------------------------------------------------
 
@@ -189,6 +215,7 @@ class CameraWorker:
     ) -> None:
         if self._closed:
             return
+        self._reap_unkillable()
         with self._lock:
             # A retry timer that had already started running when a newer
             # spawn took over must not launch a second ffmpeg on this node.
@@ -200,7 +227,17 @@ class CameraWorker:
         self._cancel_retry()
         if not is_retry:
             self._retry_delay = 2.0
-        self._terminate_process()
+        # Either our current ffmpeg refuses to die, or an earlier one is
+        # still pinning this node (release() already cleared _proc, so
+        # terminating alone would report success). Launching a second
+        # capture either way can only produce "Device or resource busy",
+        # so report the real reason and wait for the node to free up.
+        if not self._terminate_process() or self.device.device_node in self.stuck_nodes():
+            with self._lock:
+                self._state = STATE_ERROR
+                self._error = _STUCK_MSG.format(node=self.device.device_node)
+            self._schedule_retry()
+            return
 
         fmt = self._select_format()
         cmd = encoder_mod.build_ffmpeg_command(
@@ -301,7 +338,13 @@ class CameraWorker:
                 self._stderr_tail.append(text)
 
     def _watch_exit(self, proc: subprocess.Popen) -> None:
-        proc.wait()
+        try:
+            proc.wait()
+        except Exception:  # noqa: BLE001 - a dead watchdog means no retry, ever
+            logger.exception(
+                "camera %s: watchdog failed waiting on ffmpeg", self.device.id
+            )
+            return
         should_retry = False
         with self._lock:
             if self._proc is not proc:
@@ -312,6 +355,8 @@ class CameraWorker:
             if proc.returncode not in (0, None):
                 self._state = STATE_ERROR
                 self._error = "\n".join(self._stderr_tail) or f"ffmpeg exited with code {proc.returncode}"
+                if "busy" in self._error.lower():
+                    self._error += self._busy_hint()
                 logger.warning("camera %s: ffmpeg exited unexpectedly: %s", self.device.id, self._error)
                 # Only auto-retry preview failures (e.g. a transient "Device
                 # or resource busy" while another process is still releasing
@@ -319,6 +364,19 @@ class CameraWorker:
                 should_retry = self._recording_path is None
         if should_retry:
             self._schedule_retry()
+
+    def _busy_hint(self) -> str:
+        """Name whoever is holding the node, so "Device or resource busy"
+        points at a process instead of being a dead end."""
+        node = self.device.device_node
+        try:
+            mine = str(os.getpid())
+            holders = [h for h in device_holders(node) if h.split()[0] != mine]
+        except Exception:  # noqa: BLE001 - diagnostics must never mask the real error
+            return ""
+        if not holders:
+            return f"\n(nothing else holds {node}; the device or its USB link is wedged)"
+        return f"\n({node} is held by: {', '.join(holders)})"
 
     def _schedule_retry(self) -> None:
         delay = self._retry_delay
@@ -339,28 +397,82 @@ class CameraWorker:
                 return
         self._spawn(record_path=None, is_retry=True, retry_seq=seq)
 
-    def _terminate_process(self) -> None:
+    @staticmethod
+    def _wait_for_exit(proc: subprocess.Popen) -> bool:
+        try:
+            proc.wait(timeout=5)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+        except OSError:
+            return proc.poll() is not None
+
+    def _signal(self, proc: subprocess.Popen, action) -> None:
+        try:
+            action()
+        except OSError as exc:
+            logger.debug("camera %s: signalling ffmpeg failed: %s", self.device.id, exc)
+
+    def _terminate_process(self) -> bool:
+        """Stop the current ffmpeg and free its device node. Returns True
+        only when the node is confirmed released.
+
+        This never raises. ffmpeg blocked in an uninterruptible USB ioctl
+        on a wedged camera survives even SIGKILL, and the old code let the
+        resulting TimeoutExpired escape - which aborted whichever bulk
+        operation was walking the workers (rescan, shutdown) partway
+        through, leaving the registry half-updated with two workers bound
+        to one /dev/videoN. The loser of that fight then reported "Device
+        or resource busy" forever.
+        """
         with self._lock:
             proc = self._proc
             self._proc = None
         if proc is None:
-            return
+            return True
         if proc.poll() is not None:
-            return
-        try:
-            if proc.stdin:
-                try:
-                    proc.stdin.write(b"q")
-                    proc.stdin.flush()
-                except (BrokenPipeError, OSError):
-                    pass
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            logger.warning("camera %s: ffmpeg did not exit gracefully, sending SIGTERM", self.device.id)
-            proc.terminate()
+            return True
+
+        if proc.stdin:
             try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                logger.warning("camera %s: ffmpeg ignored SIGTERM, sending SIGKILL", self.device.id)
-                proc.kill()
-                proc.wait(timeout=5)
+                proc.stdin.write(b"q")
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                pass
+        if self._wait_for_exit(proc):
+            return True
+
+        logger.warning("camera %s: ffmpeg did not exit gracefully, sending SIGTERM", self.device.id)
+        self._signal(proc, proc.terminate)
+        if self._wait_for_exit(proc):
+            return True
+
+        logger.warning("camera %s: ffmpeg ignored SIGTERM, sending SIGKILL", self.device.id)
+        self._signal(proc, proc.kill)
+        if self._wait_for_exit(proc):
+            return True
+
+        # Unkillable. The kernel keeps the node open until that ioctl
+        # returns, so remember it rather than pretending the node is free:
+        # anything started on it now could only fail with EBUSY.
+        node = self.device.device_node
+        logger.error(
+            "camera %s: ffmpeg (pid %s) survived SIGKILL and still holds %s",
+            self.device.id,
+            proc.pid,
+            node,
+        )
+        with self._lock:
+            self._unkillable.append((proc, node))
+        return False
+
+    def _reap_unkillable(self) -> None:
+        """Drop processes that have since exited, freeing their nodes."""
+        with self._lock:
+            self._unkillable = [(p, n) for p, n in self._unkillable if p.poll() is None]
+
+    def stuck_nodes(self) -> set[str]:
+        """Device nodes still pinned by an ffmpeg that would not die."""
+        self._reap_unkillable()
+        with self._lock:
+            return {node for _, node in self._unkillable}

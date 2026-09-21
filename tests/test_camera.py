@@ -63,6 +63,7 @@ class FakeProc:
     live = 0
     max_live = 0
     lock = threading.Lock()
+    pid = 4242
 
     def __init__(self, *_args, **_kwargs):
         self.returncode = None
@@ -161,3 +162,57 @@ def test_release_frees_the_node_but_allows_restart(worker):
 
         worker.start_preview()
         assert FakeProc.live == 1
+
+
+class WedgedProc(FakeProc):
+    """An ffmpeg blocked in an uninterruptible USB ioctl on a wedged
+    camera: it ignores 'q', SIGTERM and SIGKILL, so every wait() times
+    out. The kernel keeps its /dev/videoN open until that ioctl returns.
+    """
+
+    def _finish(self):
+        return None
+
+    def wait(self, timeout=None):
+        raise subprocess.TimeoutExpired("ffmpeg", timeout or 0)
+
+
+def test_release_never_raises_when_ffmpeg_cannot_be_killed(worker):
+    """Teardown that throws is what corrupted the registry: it escaped
+    through release()/stop() and aborted whichever loop (rescan,
+    shutdown) was walking the workers, part-way through."""
+    with mock.patch("subprocess.Popen", WedgedProc):
+        worker.start_preview()
+        assert worker.release() is False          # reported, not raised
+    assert worker.state == STATE_ERROR
+    assert "/dev/video0" in worker.status().error
+    # The node is known to be still pinned, so nothing may reopen it.
+    assert worker.stuck_nodes() == {"/dev/video0"}
+
+
+def test_no_second_ffmpeg_is_started_on_a_pinned_node(worker):
+    """Starting another capture on a node our own unkillable ffmpeg still
+    holds could only ever fail with "Device or resource busy"."""
+    with mock.patch("subprocess.Popen", WedgedProc):
+        worker.start_preview()
+        worker.release()
+        before = WedgedProc.live
+        worker.start_preview()
+        assert WedgedProc.live == before, "spawned a doomed second ffmpeg"
+    assert worker.state == STATE_ERROR
+
+
+def test_worker_recovers_once_the_wedged_process_finally_exits(worker):
+    """The node frees up when the stuck ioctl returns; the camera must
+    come back by itself rather than staying in error forever."""
+    with mock.patch("subprocess.Popen", WedgedProc):
+        worker.start_preview()
+        worker.release()
+        stuck = worker._unkillable[0][0]
+    assert worker.stuck_nodes() == {"/dev/video0"}
+
+    stuck.returncode = 0                           # the ioctl returned
+    assert worker.stuck_nodes() == set()
+    with mock.patch("subprocess.Popen", FakeProc):
+        worker.start_preview()
+    assert worker.state == "preview"

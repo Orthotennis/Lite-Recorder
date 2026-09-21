@@ -264,6 +264,31 @@ def probe_device(device_node: str) -> CameraDevice | None:
         os.close(fd)
 
 
+def device_holders(device_node: str) -> list[str]:
+    """Which processes currently have `device_node` open, as "pid (name)".
+
+    "Device or resource busy" from ffmpeg means some other file
+    descriptor already has this V4L2 node streaming, but ffmpeg cannot
+    say whose. Resolving it through /proc turns that dead end into an
+    answer - typically a leftover ffmpeg from a previous run.
+    """
+    holders = []
+    for proc_dir in glob.glob("/proc/[0-9]*"):
+        pid = os.path.basename(proc_dir)
+        try:
+            for fd in os.listdir(os.path.join(proc_dir, "fd")):
+                if os.path.realpath(os.path.join(proc_dir, "fd", fd)) == device_node:
+                    try:
+                        name = open(os.path.join(proc_dir, "comm")).read().strip()
+                    except OSError:
+                        name = "?"
+                    holders.append(f"{pid} ({name})")
+                    break
+        except OSError:
+            continue  # process exited, or not ours to inspect
+    return holders
+
+
 def discover_cameras(known: dict[str, CameraDevice] | None = None) -> list[CameraDevice]:
     """Enumerate every /dev/video* node and return the subset that are
     genuine capture devices, sorted by device node for stable ordering.
