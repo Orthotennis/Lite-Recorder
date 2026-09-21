@@ -193,12 +193,23 @@ def test_discover_cameras_filters_and_orders(tmp_path):
 # create the duplicate in the first place.
 
 
-def _fake_v4l2_tree(nodes: dict, sysfs: dict):
-    """Patch glob/open/ioctl/sysfs for a set of {node: FakeV4L2Node}."""
+def _fake_v4l2_tree(nodes: dict, sysfs: dict, busy=(), opened=None):
+    """Patch glob/open/ioctl/sysfs for a set of {node: FakeV4L2Node}.
+
+    `busy` are nodes whose open() raises EBUSY, as a node we are already
+    capturing from does; `opened` collects every node actually opened, so
+    a test can assert that a live camera's other nodes were left alone.
+    """
+    import errno
+
     fds = {node: i + 1 for i, node in enumerate(sorted(nodes))}
     by_fd = {fd: nodes[node] for node, fd in fds.items()}
 
     def fake_open(path, *_args, **_kwargs):
+        if path in busy:
+            raise OSError(errno.EBUSY, "Device or resource busy")
+        if opened is not None:
+            opened.append(path)
         return fds[path]
 
     def fake_ioctl(fd, request, buf):
@@ -223,12 +234,23 @@ def _fake_v4l2_tree(nodes: dict, sysfs: dict):
     )
 
 
-def _discover(nodes, sysfs, known=None):
-    patches = _fake_v4l2_tree(nodes, sysfs)
+def _discover(nodes, sysfs, known=None, busy=(), opened=None):
+    patches = _fake_v4l2_tree(nodes, sysfs, busy=busy, opened=opened)
     for p in patches:
         p.start()
     try:
         return discovery.discover_cameras(known=known)
+    finally:
+        for p in patches:
+            p.stop()
+
+
+def _describe(nodes, sysfs, busy=()):
+    patches = _fake_v4l2_tree(nodes, sysfs, busy=busy)
+    for p in patches:
+        p.start()
+    try:
+        return discovery.describe_nodes()
     finally:
         for p in patches:
             p.stop()
@@ -347,3 +369,99 @@ def test_physical_key_does_not_merge_platform_devices_without_sysfs():
 
     assert a != b
     assert usb_a == usb_b
+
+
+def _isp_nodes():
+    return {
+        "/dev/video0": FakeV4L2Node(
+            "rkisp", "rkisp_mainpath", "platform:rkisp-vir0", [("NV12", [(1920, 1080, [30])])]
+        ),
+        "/dev/video1": FakeV4L2Node(
+            "rkisp", "rkisp_selfpath", "platform:rkisp-vir0", [("NV12", [(1280, 720, [30])])]
+        ),
+        "/dev/video2": FakeV4L2Node(
+            "rkisp", "rkisp_rawwr0", "platform:rkisp-vir0", [("BG10", [(1920, 1080, [30])])]
+        ),
+    }
+
+
+def _known_mainpath():
+    return discovery.CameraDevice(
+        id="video0", device_node="/dev/video0", name="rkisp_mainpath",
+        source="csi", driver="rkisp",
+        formats=[discovery.FrameFormat("NV12", 1920, 1080, [30.0])],
+        physical_key="sysfs:/sys/devices/platform/rkisp-vir0",
+        sibling_nodes=["/dev/video1", "/dev/video2"],
+    )
+
+
+def test_live_cameras_other_nodes_are_left_shut():
+    """Rescan runs while cameras stream, and the "Rescan Cameras" button is
+    exactly what someone presses when a camera looks wrong. Opening the
+    other nodes of a streaming ISP pipeline tells us nothing we don't
+    already know and risks disturbing the capture, so it must not happen."""
+    nodes = _isp_nodes()
+    sysfs = dict.fromkeys(nodes, "/sys/devices/platform/rkisp-vir0")
+    known = {"/dev/video0": _known_mainpath()}
+    opened = []
+
+    cams = _discover(nodes, sysfs, known=known, busy=["/dev/video0"], opened=opened)
+
+    assert opened == []  # nothing was opened at all
+    assert [c.device_node for c in cams] == ["/dev/video0"]
+    # The siblings we chose not to probe are still known to belong to it.
+    assert cams[0].sibling_nodes == ["/dev/video1", "/dev/video2"]
+
+
+def test_idle_camera_nodes_are_still_reprobed():
+    """The skip above is only justified while the node is in use; an idle
+    camera must still be re-probed so topology changes are picked up."""
+    nodes = _isp_nodes()
+    sysfs = dict.fromkeys(nodes, "/sys/devices/platform/rkisp-vir0")
+    known = {"/dev/video0": _known_mainpath()}
+    opened = []
+
+    _discover(nodes, sysfs, known=known, opened=opened)
+
+    assert sorted(opened) == ["/dev/video0", "/dev/video1", "/dev/video2"]
+
+
+def test_busy_node_reassigned_to_another_device_is_not_trusted():
+    """A busy node's identity is carried over from the last probe. If sysfs
+    says the node now belongs to different hardware, carrying it forward
+    would point a worker at another camera's node - so it is discarded and
+    re-probed once the node is released."""
+    nodes = _isp_nodes()
+    sysfs = dict.fromkeys(nodes, "/sys/devices/platform/rkisp-vir1")  # moved!
+    known = {"/dev/video0": _known_mainpath()}  # remembers vir0
+
+    cams = _discover(nodes, sysfs, known=known, busy=["/dev/video0"])
+
+    assert "/dev/video0" not in [c.device_node for c in cams]
+
+
+def test_describe_nodes_reports_busy_nodes_instead_of_dropping_them():
+    """--list-devices is normally run while the recorder holds its cameras.
+    Silently omitting a busy node would hide the camera being diagnosed."""
+    nodes = _isp_nodes()
+    sysfs = dict.fromkeys(nodes, "/sys/devices/platform/rkisp-vir0")
+
+    cameras, reports = _describe(nodes, sysfs, busy=["/dev/video0"])
+
+    assert [r.node for r in reports] == ["/dev/video0", "/dev/video1", "/dev/video2"]
+    assert reports[0].status == "busy"
+    # Every node is accounted for, and the rest still group into one camera.
+    assert len(cameras) == 1
+    assert {r.camera_id for r in reports[1:]} == {cameras[0].id}
+
+
+def test_describe_nodes_labels_non_capture_nodes():
+    nodes = _isp_nodes()
+    nodes["/dev/video3"] = FakeV4L2Node("rkisp", "rkisp_stats", "platform:rkisp-vir0", [])
+    sysfs = dict.fromkeys(nodes, "/sys/devices/platform/rkisp-vir0")
+
+    _cameras, reports = _describe(nodes, sysfs)
+
+    statuses = {r.node: r.status for r in reports}
+    assert statuses["/dev/video3"] == "other"
+    assert statuses["/dev/video0"] == "capture"

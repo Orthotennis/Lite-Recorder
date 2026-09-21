@@ -211,16 +211,23 @@ produces a camera that can never start, and no amount of retrying will
 clear it — which looks exactly like a bug in the app.
 
 Discovery groups nodes by their physical device and captures from one
-node per device. To see what your board actually exposes, and which
-nodes were grouped together:
+node per device. To see what your board actually exposes, which nodes
+were grouped together, and what every remaining node is:
 
 ```
+sudo systemctl stop lite-recorder
 /opt/lite-recorder/venv/bin/python -m lite_recorder --list-devices
+sudo systemctl start lite-recorder
 ```
 
-A node listed under "also exposes" is a second path into a camera
-that is already listed — not a missing camera. If the camera count
-matches what is physically attached, the grouping is right.
+A node listed under "also exposes" is a second path into a camera that
+is already listed — not a missing camera. If the camera count matches
+what is physically attached, the grouping is right.
+
+Stopping the service first is worth it: a node the recorder already has
+open can only be reported as `busy`, and this command opens every node
+to identify it — including paths into a camera that is mid-recording,
+which normal operation deliberately avoids.
 
 If a camera that *should* work is busy, the holder is outside the app.
 Check with:

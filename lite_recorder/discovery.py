@@ -358,7 +358,9 @@ def device_holders(device_node: str) -> list[str]:
 
 
 def _collapse_to_physical_devices(
-    probed: list[CameraDevice], known: dict[str, CameraDevice]
+    probed: list[CameraDevice],
+    known: dict[str, CameraDevice],
+    skipped: set[str] | None = None,
 ) -> list[CameraDevice]:
     """Reduce the probed nodes to one per physical device.
 
@@ -375,6 +377,7 @@ def _collapse_to_physical_devices(
     that: the device is legitimately in use. Only the best node of each
     device becomes a camera; the rest are recorded as its siblings.
     """
+    skipped = skipped or set()
     groups: dict[str, list[CameraDevice]] = {}
     for device in probed:
         key = device.physical_key or f"node:{device.device_node}"
@@ -384,20 +387,77 @@ def _collapse_to_physical_devices(
     for key, members in groups.items():
         members.sort(key=lambda d: _capture_rank(d, d.device_node in known), reverse=True)
         primary, *rest = members
-        primary.sibling_nodes = [d.device_node for d in rest]
-        if rest:
+        # Nodes left unprobed on purpose (below) are absent from `members`,
+        # so they have to be carried over rather than dropped from the
+        # device they are already known to belong to.
+        siblings = {d.device_node for d in rest}
+        siblings |= {s for s in primary.sibling_nodes if s in skipped}
+        primary.sibling_nodes = sorted(siblings, key=_node_number)
+        if rest or primary.sibling_nodes:
             logger.info(
                 "%s exposes %d capture nodes (%s) - these are alternate paths "
                 "of one device, so capturing from %s only; opening the others "
                 "could report nothing but 'Device or resource busy'",
                 primary.name or key,
-                len(members),
-                ", ".join(d.device_node for d in members),
+                1 + len(primary.sibling_nodes),
+                ", ".join([primary.device_node, *primary.sibling_nodes]),
                 primary.device_node,
             )
         cameras.append(primary)
     cameras.sort(key=lambda d: _node_number(d.device_node))
     return cameras
+
+
+def video_nodes() -> list[str]:
+    """Every /dev/video* node, in kernel numbering order."""
+    return sorted(
+        glob.glob("/dev/video*"),
+        key=lambda p: int("".join(filter(str.isdigit, p)) or 0),
+    )
+
+
+def _still_the_same_device(node: str, previous: CameraDevice) -> bool:
+    """Whether a busy node is still the device it was last probed as.
+
+    A busy node cannot be opened, so its identity has to be carried over
+    from the last successful probe - but /dev/videoN gets reassigned when
+    hardware comes and goes, and carrying a stale identity forward is how
+    a worker ends up pointed at another camera's node. sysfs answers this
+    without opening anything, so it works on a node we are streaming from.
+    """
+    path = _sysfs_device_path(node)
+    if path is None or not previous.physical_key.startswith("sysfs:"):
+        return True  # nothing to compare against - trust the last probe
+    return previous.physical_key == f"sysfs:{path}"
+
+
+def _probe_node(
+    node: str, known: dict[str, CameraDevice]
+) -> tuple[CameraDevice | None, bool]:
+    """Probe one node. Returns (device, busy), where `busy` means the node
+    exists but is already open - normally by our own capture process."""
+    try:
+        return probe_device(node), False
+    except DeviceBusyError:
+        previous = known.get(node)
+        if previous is None:
+            logger.warning("%s is busy and was never probed successfully; skipping", node)
+            return None, True
+        if not _still_the_same_device(node, previous):
+            # Dropping it here lets the worker be torn down and the node
+            # released, so the next pass can probe it for real.
+            logger.warning(
+                "%s is busy but sysfs says it is no longer the device %s was "
+                "probed on; discarding the stale identity",
+                node,
+                previous.id,
+            )
+            return None, True
+        logger.debug("%s is busy (in use); keeping known device %s", node, previous.id)
+        return previous, True
+    except Exception:
+        logger.exception("failed to probe %s, skipping", node)
+        return None, False
 
 
 def discover_cameras(known: dict[str, CameraDevice] | None = None) -> list[CameraDevice]:
@@ -410,23 +470,88 @@ def discover_cameras(known: dict[str, CameraDevice] | None = None) -> list[Camer
     would look like "not a camera" and the live camera would be torn down
     and recreated on every rescan. It also keeps the choice of node stable
     for a device that exposes more than one."""
-    nodes = sorted(glob.glob("/dev/video*"), key=lambda p: int("".join(filter(str.isdigit, p)) or 0))
+    nodes = video_nodes()
     known = known or {}
-    probed: list[CameraDevice] = []
+    present = set(nodes)
+    probed: dict[str, CameraDevice] = {}
+    skipped: set[str] = set()
+
+    # Pass 1: the nodes we already capture from, so that the cameras that
+    # are live right now are identified before anything decides whether to
+    # open their remaining nodes.
     for node in nodes:
+        if node not in known:
+            continue
+        device, busy = _probe_node(node, known)
+        if device is None:
+            continue
+        probed[node] = device
+        if busy:
+            # This camera is streaming. Its other nodes are the same piece
+            # of hardware and we already know it, so opening them tells us
+            # nothing - while a stray open() on a streaming ISP pipeline is
+            # exactly the kind of poke that disturbs it. Leave them shut.
+            skipped |= {s for s in device.sibling_nodes if s in present}
+
+    # Pass 2: everything else, in node order.
+    for node in nodes:
+        if node in probed or node in skipped:
+            continue
+        device, _busy = _probe_node(node, known)
+        if device is not None:
+            probed[node] = device
+
+    ordered = [probed[node] for node in nodes if node in probed]
+    return _collapse_to_physical_devices(ordered, known, skipped)
+
+
+@dataclass
+class NodeReport:
+    """What one /dev/videoN node turned out to be, for diagnostics."""
+
+    node: str
+    status: str  # "capture" | "busy" | "other" | "error"
+    detail: str = ""
+    camera_id: str = ""  # the camera it was attributed to, if any
+
+
+def describe_nodes() -> tuple[list[CameraDevice], list[NodeReport]]:
+    """One probe pass over every /dev/video*, for diagnostics.
+
+    Unlike discover_cameras() this reports the nodes it could *not* use,
+    busy ones above all. A busy node is the normal case while the recorder
+    is running, and dropping it silently would hide the very camera
+    someone is trying to diagnose.
+
+    This opens every node, including the alternate paths of a device that
+    is streaming - which discover_cameras() deliberately avoids - so it is
+    best run with the recorder stopped.
+    """
+    probed: list[CameraDevice] = []
+    reports: list[NodeReport] = []
+    for node in video_nodes():
         try:
             cam = probe_device(node)
         except DeviceBusyError:
-            previous = known.get(node)
-            if previous is None:
-                logger.warning("%s is busy and was never probed successfully; skipping", node)
-                continue
-            logger.debug("%s is busy (in use); keeping known device %s", node, previous.id)
-            probed.append(previous)
+            holders = device_holders(node)
+            reports.append(
+                NodeReport(node, "busy", ", ".join(holders) if holders else "holder unknown")
+            )
             continue
-        except Exception:
-            logger.exception("failed to probe %s, skipping", node)
+        except Exception as exc:  # noqa: BLE001 - a diagnostic reports, never raises
+            reports.append(NodeReport(node, "error", str(exc)))
             continue
-        if cam is not None:
+        if cam is None:
+            reports.append(NodeReport(node, "other", "not a capture node (metadata/subdev)"))
+        else:
             probed.append(cam)
-    return _collapse_to_physical_devices(probed, known)
+            reports.append(NodeReport(node, "capture"))
+
+    cameras = _collapse_to_physical_devices(probed, {})
+    owner = {}
+    for cam in cameras:
+        for node in [cam.device_node, *cam.sibling_nodes]:
+            owner[node] = cam.id
+    for report in reports:
+        report.camera_id = owner.get(report.node, "")
+    return cameras, reports

@@ -21,11 +21,15 @@ def _list_devices() -> None:
     """
     from . import discovery
 
-    cameras = discovery.discover_cameras()
-    if not cameras:
-        print("No capture devices found under /dev/video*")
+    cameras, reports = discovery.describe_nodes()
+    if not reports:
+        print(
+            "No /dev/video* nodes exist at all. If you expect MIPI CSI\n"
+            "cameras, their device-tree overlay is probably not enabled."
+        )
         return
-    print(f"{len(cameras)} camera(s):\n")
+
+    print(f"{len(cameras)} camera(s) from {len(reports)} /dev/video* node(s):\n")
     for cam in cameras:
         print(f"  {cam.id}")
         print(f"    name        {cam.name}  ({cam.source}, {cam.driver})")
@@ -39,11 +43,21 @@ def _list_devices() -> None:
         best = cam.best_effort_default_format()
         if best:
             print(f"    default     {best.pixel_format} {best.width}x{best.height}")
-        for node in [cam.device_node, *cam.sibling_nodes]:
-            holders = discovery.device_holders(node)
-            if holders:
-                print(f"    in use      {node} held by {', '.join(holders)}")
         print()
+
+    print("every /dev/video* node:")
+    for r in reports:
+        note = f"  -> {r.camera_id}" if r.camera_id else ""
+        detail = f"  [{r.detail}]" if r.detail else ""
+        print(f"  {r.node:15s} {r.status:8s}{detail}{note}")
+
+    busy = [r for r in reports if r.status == "busy"]
+    if busy:
+        print(
+            f"\n{len(busy)} node(s) are already open, so they could not be\n"
+            "identified here. That is normal while the recorder is running -\n"
+            "stop it (sudo systemctl stop lite-recorder) for a full picture."
+        )
 
 
 def main() -> None:
