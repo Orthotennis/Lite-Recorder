@@ -36,10 +36,12 @@ def test_list_cameras(client):
 
 def test_patch_camera(client):
     cam_id = client.get("/api/cameras").json()[0]["id"]
+    # Simulated cameras only advertise 30fps, so an unsupported request
+    # (24) is clamped to the nearest rate the device actually supports.
     res = client.patch(f"/api/cameras/{cam_id}", json={"label": "front-door", "fps": 24})
     assert res.status_code == 200
     assert res.json()["label"] == "front-door"
-    assert res.json()["fps"] == 24
+    assert res.json()["fps"] == 30
 
 
 def test_patch_unknown_camera_404(client):

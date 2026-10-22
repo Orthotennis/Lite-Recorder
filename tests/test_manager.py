@@ -167,6 +167,27 @@ def test_update_camera_persists_label(manager):
     assert stored["label"] == "front-door"
 
 
+def test_update_camera_clamps_fps_to_what_the_camera_actually_supports(tmp_path, monkeypatch):
+    """Requesting an fps the camera can't deliver doesn't error - ffmpeg
+    just pads the gaps by repeating the last real frame, which shows up as
+    a smeared/duplicated-looking recording. The UI must never be allowed to
+    set an fps the device doesn't advertise for the current format."""
+    devices = [[_dev("cam-a", "/dev/video0")]]
+    with mock.patch("subprocess.Popen", _WedgedProc):
+        mgr = _real_manager(tmp_path, monkeypatch, devices)
+        cam_id = next(iter(mgr._workers))
+        status = mgr.update_camera(cam_id, {"width": 1920, "height": 1200, "fps": 120})
+        assert status.fps == 120  # exact match: no clamping needed
+
+        status = mgr.update_camera(cam_id, {"fps": 90})
+        assert status.fps == 120  # nearest of [120.0, 30.0]
+
+        status = mgr.update_camera(cam_id, {"fps": 45})
+        assert status.fps == 30  # nearest of [120.0, 30.0]
+        assert mgr.config_store.get(cam_id)["fps"] == 30
+        mgr.shutdown()
+
+
 def test_update_camera_unknown_id_raises(manager):
     with pytest.raises(KeyError):
         manager.update_camera("does-not-exist", {"label": "x"})

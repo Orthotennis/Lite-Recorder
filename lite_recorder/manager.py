@@ -43,6 +43,24 @@ def _default_fps(fmt: discovery.FrameFormat | None) -> int:
     return int(max(within_cap) if within_cap else min(fmt.framerates))
 
 
+def _clamp_fps(device: discovery.CameraDevice, pixel_format: str, width: int, height: int, requested_fps: int) -> int:
+    """Snap `requested_fps` to the nearest rate the device actually
+    advertises for this pixel format/resolution.
+
+    ffmpeg's v4l2 input trusts whatever `-framerate` it's given for the
+    stream's timestamps, even when the driver negotiates a slower rate -
+    so asking for a camera's unsupported fps doesn't error, it just makes
+    ffmpeg pad the gaps by repeating the last real frame (e.g. requesting
+    120fps from a camera that only delivers 30 shows every frame four
+    times over)."""
+    for fmt in device.formats:
+        if fmt.pixel_format == pixel_format and fmt.width == width and fmt.height == height:
+            if not fmt.framerates:
+                return requested_fps
+            return int(min(fmt.framerates, key=lambda r: abs(r - requested_fps)))
+    return requested_fps
+
+
 def slugify(label: str) -> str:
     slug = _SLUG_RE.sub("-", label.strip()).strip("-")
     return slug or "camera"
@@ -213,6 +231,18 @@ class CameraManager:
             changed = {
                 k for k, v in clean_patch.items() if getattr(worker.settings, k) != v
             }
+            if changed & _CAPTURE_FIELDS:
+                requested_fps = clean_patch.get("fps", worker.settings.fps)
+                clamped_fps = _clamp_fps(
+                    worker.device,
+                    clean_patch.get("pixel_format", worker.settings.pixel_format),
+                    clean_patch.get("width", worker.settings.width),
+                    clean_patch.get("height", worker.settings.height),
+                    requested_fps,
+                )
+                if clamped_fps != requested_fps:
+                    clean_patch["fps"] = clamped_fps
+                    changed.add("fps")
             self.config_store.update(camera_id, clean_patch)
             for key, value in clean_patch.items():
                 setattr(worker.settings, key, value)
